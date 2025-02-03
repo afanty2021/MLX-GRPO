@@ -13,6 +13,7 @@ from typing import List, Optional, Dict, Any
 import math
 from mlx.optimizers import Adam  # Use the new optimizer module
 import re
+import inspect  # ensure inspect is imported
 
 # -------------------------------------------------------------------
 # Dataset Preparation and Formatting
@@ -286,12 +287,21 @@ class MLXGRPOTrainer:
         for completions in responses:
             reward = 0
             for f in self.reward_funcs:
-                try:
-                    # Try calling the function with both completions and reference answer
-                    result = f(completions, reference)
-                except TypeError:
-                    # If that fails, assume the function only accepts one argument
+                sig = inspect.signature(f)
+                call_args = {}
+                # Build a dictionary based on expected parameter names.
+                for param in sig.parameters:
+                    if param in ("completions", "response", "prompts"):
+                        call_args[param] = completions
+                    elif param == "answer":
+                        call_args[param] = reference
+                    elif param == "batch":
+                        call_args[param] = batch
+                if not call_args:
+                    # Fallback: assume the function accepts a single positional argument.
                     result = f(completions)
+                else:
+                    result = f(**call_args)
                 if isinstance(result, list):
                     result = sum(result)
                 reward += result
@@ -305,7 +315,18 @@ class MLXGRPOTrainer:
         
         # Compute loss and update model
         def loss_fn(model):
-            logits = model(batch['input_ids'])
+            # Tokenize the formatted prompt from the batch.
+            messages = batch.get('prompt', [])
+            formatted_prompt = ""
+            for msg in messages:
+                if msg['role'] == 'system':
+                    formatted_prompt += f"System: {msg['content']}\n"
+                elif msg['role'] == 'user':
+                    formatted_prompt += f"User: {msg['content']}\n"
+                elif msg['role'] == 'assistant':
+                    formatted_prompt += f"Assistant: {msg['content']}\n"
+            tokens = self.tokenizer(formatted_prompt, return_tensors="np", padding=True).input_ids
+            logits = model(tokens)
             loss = -mx.mean(rewards * logits)
             return loss
             
