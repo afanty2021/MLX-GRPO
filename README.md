@@ -9,20 +9,21 @@
 - **Dataset Preprocessing:** Uses the GSM8K dataset to test multi-step reasoning.
 - **Modern Python Packaging:** Managed via `pyproject.toml` and launched using the `uv` CLI runner.
 - **Easy to Run:** Start training with:
+  
   ```bash
-  uv run train_grpo.py
+  uv run mlx-grpo.py
   ```
 
 ## Installation
 
 1. **Clone the Repository:**
    ```bash
-   git clone https://github.com/yourusername/MLX-GRPO.git
+   git clone https://github.com/Doriandarko/MLX-GRPO.git
    cd MLX-GRPO
    ```
 
 2. **Create and Activate a Virtual Environment:**
-   (Ensure you have Python 3.12 or later installed.)
+   (Ensure you have Python 3.11 or later installed.)
    ```bash
    python3 -m venv venv
    source venv/bin/activate
@@ -41,8 +42,9 @@
 ## Usage
 
 To start training using the GRPO pipeline (pure MLX), simply run:
+
 ```bash
-uv run train_grpo.py
+uv run mlx-grpo.py
 ```
 This command uses the `uv` CLI runner, which reads the configuration from `pyproject.toml` and runs the `train_grpo.py` script.
 
