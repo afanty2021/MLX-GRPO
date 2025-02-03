@@ -1,0 +1,5 @@
+[build-system] requires = ["setuptools", "wheel"] build-backend = "setuptools.build_meta"
+
+[project] name = "mlx-grpo" version = "0.1.0" description = "A pure MLX-based GRPO training pipeline for chain-of-thought reasoning on Apple Silicon." authors = [ { name = "Your Name", email = "youremail@example.com" } ] readme = "README.md" license = { file = "LICENSE" } requires-python = ">=3.12" dependencies = [ "torch>=2.0", # Required for tensor types in MLX-LM "datasets>=2.10", "transformers>=4.40", # For tokenizer utilities "peft>=0.2", "trl>=0.3", "mlx>=0.22", "mlx-lm>=0.10", "uv>=0.0.1" # uv CLI runner to execute: uv run train_grpo.py ]
+
+[project.scripts] run = "train_grpo:main"
