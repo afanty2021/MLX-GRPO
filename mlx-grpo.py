@@ -146,6 +146,13 @@ def load_model(model_name):
     """Load model and tokenizer"""
     model, tokenizer = mlx_load(model_name)
     tokenizer.pad_token = tokenizer.eos_token
+
+    # Fix: Add a forward function to the model dictionary so that it becomes callable.
+    def forward_fn(**tokens_dict):
+        # Call the apply_fn with the learned parameters from the model dictionary.
+        return model["apply_fn"](model["params"], **tokens_dict)
+    model["forward"] = forward_fn
+
     return model, tokenizer
 
 # Update the model loading call
@@ -325,8 +332,29 @@ class MLXGRPOTrainer:
                     formatted_prompt += f"User: {msg['content']}\n"
                 elif msg['role'] == 'assistant':
                     formatted_prompt += f"Assistant: {msg['content']}\n"
-            tokens = self.tokenizer(formatted_prompt, return_tensors="np", padding=True).input_ids
-            logits = model(tokens)
+            tokens_dict = self.tokenizer.encode_plus(
+                    formatted_prompt,
+                    return_tensors="np",
+                    padding=True
+                )
+            # Call model using keyword arguments. Check different possibilities for invoking the model.
+            if callable(model):
+                output = model(**tokens_dict)
+            elif isinstance(model, dict) and "forward" in model and callable(model["forward"]):
+                output = model["forward"](**tokens_dict)
+            elif hasattr(model, "forward") and callable(model.forward):
+                output = model.forward(**tokens_dict)
+            elif hasattr(model, "apply") and callable(model.apply):
+                output = model.apply(**tokens_dict)
+            else:
+                raise ValueError("Model is not callable and has no forward or apply method.")
+
+            # If output is a tuple/list, assume that the logits are the first element.
+            if isinstance(output, (list, tuple)):
+                logits = output[0]
+            else:
+                logits = output
+
             loss = -mx.mean(rewards * logits)
             return loss
             
