@@ -5,12 +5,14 @@ from datasets import load_dataset, Dataset
 from transformers import AutoTokenizer  # Not using AutoModelForCausalLM anymore
 from peft import LoraConfig
 from trl import GRPOConfig, GRPOTrainer
-from mlx import load as mlx_load, generate as mlx_generate  # Use MLX-LM functions exclusively
+from mlx_lm import load as mlx_load, generate as mlx_generate
 import numpy as np
 import os
 from dataclasses import dataclass
 from typing import List, Optional, Dict, Any
 import math
+from mlx.optimizers import Adam  # Use the new optimizer module
+import re
 
 # -------------------------------------------------------------------
 # Dataset Preparation and Formatting
@@ -141,8 +143,7 @@ peft_config = LoraConfig(
 # Replace the model loading section
 def load_model(model_name):
     """Load model and tokenizer"""
-    model = mx.load(model_name)
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model, tokenizer = mlx_load(model_name)
     tokenizer.pad_token = tokenizer.eos_token
     return model, tokenizer
 
@@ -182,12 +183,7 @@ class MLXGRPOTrainer:
         self.train_dataset = train_dataset
         
         # Enhanced optimizer configuration
-        self.optimizer = mx.optimizers.Adam(
-            learning_rate=self._get_scheduler(),
-            b1=args.adam_beta1,
-            b2=args.adam_beta2,
-            weight_decay=args.weight_decay
-        )
+        self.optimizer = Adam(args.learning_rate, model.parameters())
         
         self.step = 0
         self.total_steps = len(train_dataset) * args.num_epochs
@@ -207,23 +203,37 @@ class MLXGRPOTrainer:
         return self.args.learning_rate * lr_schedule
     
     def generate_responses(self, batch):
-        """Generate multiple responses for each prompt using MLX"""
-        all_responses = []
+        """Generate responses for a batch of prompts"""
+        responses = []
         
+        def generate_fn():
+            # Format the prompt from the messages
+            messages = batch['prompt']
+            formatted_prompt = ""
+            for msg in messages:
+                if msg['role'] == 'system':
+                    formatted_prompt += f"System: {msg['content']}\n"
+                elif msg['role'] == 'user':
+                    formatted_prompt += f"User: {msg['content']}\n"
+                elif msg['role'] == 'assistant':
+                    formatted_prompt += f"Assistant: {msg['content']}\n"
+            
+            output = mlx_generate(
+                self.model,
+                self.tokenizer,
+                formatted_prompt
+            )
+            # If output is already a dict with key "content", wrap it in a nested list.
+            if isinstance(output, dict) and "content" in output:
+                return [[ output ]]
+            else:
+                return [[ {"content": output} ]]
+            
         for _ in range(self.args.num_generations):
-            @mx.compile
-            def generate_fn():
-                return self.model.generate(
-                    batch['input_ids'],
-                    max_length=self.args.max_completion_length,
-                    temperature=0.7,  # Add some randomness for diverse generations
-                    top_p=0.9
-                )
-            
             response = generate_fn()
-            all_responses.append(response)
-            
-        return all_responses
+            responses.append(response)
+        
+        return responses
     
     def compute_rewards(self, batch, responses):
         """Compute rewards using all reward functions"""
@@ -263,6 +273,50 @@ class MLXGRPOTrainer:
             "args": self.args.__dict__
         }
         mx.save(os.path.join(path, "trainer_state.safetensors"), training_state)
+
+    def train_step(self, batch):
+        """Performs a single training step using GRPO."""
+        # Generate multiple responses for each prompt
+        responses = self.generate_responses(batch)
+        
+        # Compute rewards for each prompt.
+        # Retrieve the reference answer from the batch (if available)
+        reference = batch.get("answer", None)
+        rewards = []
+        for completions in responses:
+            reward = 0
+            for f in self.reward_funcs:
+                try:
+                    # Try calling the function with both completions and reference answer
+                    result = f(completions, reference)
+                except TypeError:
+                    # If that fails, assume the function only accepts one argument
+                    result = f(completions)
+                if isinstance(result, list):
+                    result = sum(result)
+                reward += result
+            rewards.append(reward)
+        
+        # Convert rewards to mx array
+        rewards = mx.array(rewards)
+        
+        # Normalize rewards
+        rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
+        
+        # Compute loss and update model
+        def loss_fn(model):
+            logits = model(batch['input_ids'])
+            loss = -mx.mean(rewards * logits)
+            return loss
+            
+        loss, grads = mx.value_and_grad(loss_fn)(self.model)
+        
+        # Apply gradients with gradient clipping
+        grads = mx.tree_map(lambda g: mx.clip(g, -self.args.max_grad_norm, self.args.max_grad_norm), grads)
+        self.optimizer.update(self.model, grads)
+        self.step += 1
+        
+        return loss
 
     def train(self):
         """Enhanced training loop with proper logging and checkpointing"""

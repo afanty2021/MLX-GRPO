@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "datasets>=3.2.0",
+    "mlx-lm>=0.21.1",
     "mlx>=0.22.0",
     "peft>=0.14.0",
     "torch>=2.6.0",
