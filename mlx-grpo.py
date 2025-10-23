@@ -1,6 +1,6 @@
 import mlx.core as mx
 import mlx.nn as nn
-from mlx.utils import tree_flatten, tree_unflatten, tree_map
+from mlx.utils import tree_flatten, tree_map
 from datasets import load_dataset, Dataset
 from mlx_lm import load as mlx_load, generate as mlx_generate
 from mlx_lm.sample_utils import make_sampler, make_logits_processors
@@ -649,6 +649,14 @@ class MLXGRPOTrainer:
         logits_processors = make_logits_processors(
             None, repetition_penalty=None, repetition_context_size=None
         )
+        # numeric-aware compare helper (same as evaluate_em)
+        def maybe_int(s: Optional[str]):
+            if s is None:
+                return None
+            try:
+                return int(s.strip())
+            except Exception:
+                return None
 
         for idx in eval_indices:
             example = self.eval_dataset[idx]
@@ -666,17 +674,20 @@ class MLXGRPOTrainer:
                     self.model,
                     self.tokenizer,
                     prompt=formatted_prompt,
-                    max_tokens=self.args.max_new_tokens,
+                    max_tokens=self.args.eval_max_new_tokens,
                     sampler=sampler,
                     logits_processors=logits_processors,
                     verbose=False,
                 )
-
-                # Extract answer
-                predicted = extract_xml_answer(output)
-
-                if predicted == gold_answer:
-                    correct += 1
+                # Trim after </answer> if present
+                if "</answer>" in output:
+                    output = output.split("</answer>", 1)[0] + "</answer>"
+                predicted = extract_xml_answer(output).strip()
+                gold_str = gold_answer.strip()
+                # numeric-aware EM
+                gi, pi = maybe_int(gold_str), maybe_int(predicted)
+                match = (gi == pi) if (gi is not None and pi is not None) else (predicted == gold_str)
+                correct += int(match)
                 total += 1
 
             except Exception as e:
@@ -833,12 +844,7 @@ class MLXGRPOTrainer:
     def train(self):
         """Enhanced training loop with proper logging and checkpointing"""
         print(f"Starting training: {self.total_batches} batches/epoch × {self.args.num_epochs} epochs = {self.total_updates} optimizer updates")
-
-        # Open JSONL log file
-        log_path = os.path.join(self.args.output_dir, "training_log.jsonl")
-        os.makedirs(self.args.output_dir, exist_ok=True)
-        log_file = open(log_path, "w")
-        print(f"Logging metrics to {log_path}")
+        print(f"Logging metrics to {self.log_path}")
 
         for epoch in range(self.args.num_epochs):
             indices = list(range(len(self.train_dataset)))
@@ -852,25 +858,7 @@ class MLXGRPOTrainer:
                 # Training step
                 loss, policy_reward, kl_div = self.train_step(batch)
 
-                # Log to JSONL after each update
-                if (self.step % self.args.gradient_accumulation_steps) == 0:
-                    current_update = self.step // self.args.gradient_accumulation_steps
-                    current_lr = self.lr_schedule(current_update)
-                    log_entry = {
-                        "update": current_update,
-                        "batch": self.step,
-                        "epoch": epoch,
-                        "lr": float(current_lr),
-                        "loss": float(loss),
-                        "policy_reward": float(policy_reward),
-                        "kl": float(kl_div),
-                        "reward_mean": self.last_reward_mean,
-                        "reward_std": self.last_reward_std,
-                    }
-                    if self.last_em_score is not None:
-                        log_entry["em_score"] = self.last_em_score
-                    log_file.write(json.dumps(log_entry) + "\n")
-                    log_file.flush()
+                # (Per-update JSONL logging already handled in train_step via _log_jsonl)
 
                 # Logging
                 if self.step % self.args.logging_steps == 0:
@@ -899,9 +887,7 @@ class MLXGRPOTrainer:
                     self.save_checkpoint(checkpoint_path)
                     print(f"Saved checkpoint to {checkpoint_path}")
 
-        # Close log file
-        log_file.close()
-        print(f"\nTraining log saved to {log_path}")
+        print(f"\nTraining log saved to {self.log_path}")
 
 def main():
     """Main training function"""
