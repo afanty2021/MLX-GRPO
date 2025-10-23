@@ -65,8 +65,6 @@ def get_gsm8k_questions(split="train") -> Dataset:
     })  # type: ignore
     return data  # type: ignore
 
-dataset = get_gsm8k_questions()
-
 # -------------------------------------------------------------------
 # Reward Functions
 # -------------------------------------------------------------------
@@ -234,15 +232,19 @@ class MLXGRPOConfig:
     weight_decay: float = 0.0
     lr_scheduler_type: str = 'cosine'
     save_steps: int = 100
+    eval_steps: int = 50  # Run EM evaluation every N steps
+    eval_samples: int = 200  # Number of samples to use for evaluation
     seed: int = 0
+    use_compile: bool = True  # Toggle mx.compile for gradient computation
 
 class MLXGRPOTrainer:
-    def __init__(self, model, tokenizer, reward_funcs, args: MLXGRPOConfig, train_dataset):
+    def __init__(self, model, tokenizer, reward_funcs, args: MLXGRPOConfig, train_dataset, eval_dataset=None):
         self.model = model
         self.tokenizer = tokenizer
         self.reward_funcs = reward_funcs
         self.args = args
         self.train_dataset = train_dataset
+        self.eval_dataset = eval_dataset
 
         # CRITICAL: Three models as per article
         # 1. model - current trainable policy (π_θ)
@@ -258,14 +260,16 @@ class MLXGRPOTrainer:
         except Exception as e:
             print(f"Quantization skipped: {e}")
 
-        # Calculate total steps for LR schedule
-        self.step = 0
-        self.total_steps = len(train_dataset) * args.num_epochs
-        self.update_every = 10  # Sync model_old every N steps
+        # Steps / updates accounting
+        self.step = 0                                    # batch steps (for logs)
+        self.total_batches = len(train_dataset)
+        self.updates_per_epoch = max(1, math.ceil(self.total_batches / args.gradient_accumulation_steps))
+        self.total_updates = self.updates_per_epoch * args.num_epochs
+        self.update_every = 10                           # Sync model_old every N *batch* steps
 
-        # LR schedule with warmup + cosine
-        base = cosine_decay(args.learning_rate, self.total_steps)
-        warmup_steps = max(1, int(self.total_steps * self.args.warmup_ratio))
+        # LR schedule with warmup + cosine, defined over *optimizer updates*
+        base = cosine_decay(args.learning_rate, self.total_updates)
+        warmup_steps = max(1, int(self.total_updates * self.args.warmup_ratio))
         def schedule(step: int):
             warm = step / warmup_steps if step < warmup_steps else 1.0
             return base(step) * warm
@@ -275,13 +279,20 @@ class MLXGRPOTrainer:
         # Gradient accumulation
         self._accum_grads = None
 
+        # Tracking for logging
+        self.last_reward_mean = 0.0
+        self.last_reward_std = 0.0
+        self.last_em_score = None
+
     def format_prompt(self, messages: List[Dict[str, str]]) -> str:
         """
         Build the prompt using the tokenizer's chat template (e.g., Qwen),
         falling back to the legacy string format if unavailable.
         """
         try:
-            return self.tokenizer.apply_chat_template(messages, add_generation_prompt=True)
+            return self.tokenizer.apply_chat_template(
+                messages, add_generation_prompt=True, tokenize=False
+            )
         except Exception:
             formatted = ""
             for msg in messages:
@@ -538,6 +549,65 @@ class MLXGRPOTrainer:
 
         return loss, policy_reward_mean, kl_div_mean
 
+    def evaluate(self) -> float:
+        """
+        Run exact-match evaluation on a subset of test examples.
+        Returns EM score (0-1).
+        """
+        if self.eval_dataset is None:
+            return 0.0
+
+        # Sample eval_samples examples (or use all if fewer)
+        eval_size = min(self.args.eval_samples, len(self.eval_dataset))
+        eval_indices = random.sample(range(len(self.eval_dataset)), eval_size)
+
+        correct = 0
+        total = 0
+
+        # Sampler & processors for evaluation (greedy, temp=0)
+        sampler = make_sampler(temperature=0.0, top_p=1.0, min_p=0.0, min_tokens_to_keep=1)
+        logits_processors = make_logits_processors(
+            None, repetition_penalty=None, repetition_context_size=None
+        )
+
+        for idx in eval_indices:
+            example = self.eval_dataset[idx]
+            messages = example['prompt']
+            gold_answer = example.get('answer', '')
+
+            if gold_answer is None:
+                continue
+
+            formatted_prompt = self.format_prompt(messages)
+
+            try:
+                # Generate with current model (not model_old)
+                output = mlx_generate(
+                    self.model,
+                    self.tokenizer,
+                    prompt=formatted_prompt,
+                    max_tokens=self.args.max_new_tokens,
+                    sampler=sampler,
+                    logits_processors=logits_processors,
+                    verbose=False,
+                )
+
+                # Extract answer
+                predicted = extract_xml_answer(output)
+
+                if predicted == gold_answer:
+                    correct += 1
+                total += 1
+
+            except Exception as e:
+                print(f"Eval generation failed: {e}")
+                continue
+
+        em_score = correct / total if total > 0 else 0.0
+        self.last_em_score = em_score
+        print(f"\n*** Evaluation: {correct}/{total} correct (EM: {em_score:.2%}) ***")
+        return em_score
+
     def train_step(self, batch):
         """
         Performs a single training step using GRPO (following the article).
@@ -565,11 +635,11 @@ class MLXGRPOTrainer:
 
         # 2. Compute rewards and advantages
         advantages, rewards = self.compute_rewards(batch, responses)
-        reward_mean = float(mx.mean(rewards)) if num_responses > 0 else 0.0
-        reward_std = float(mx.std(rewards)) if num_responses > 0 else 0.0
+        self.last_reward_mean = float(mx.mean(rewards)) if num_responses > 0 else 0.0
+        self.last_reward_std = float(mx.std(rewards)) if num_responses > 0 else 0.0
         adv_mean = float(mx.mean(advantages)) if num_responses > 0 else 0.0
         adv_std = float(mx.std(advantages)) if num_responses > 0 else 0.0
-        print(f"Rewards - Mean: {reward_mean:.3f}, Std: {reward_std:.3f}")
+        print(f"Rewards - Mean: {self.last_reward_mean:.3f}, Std: {self.last_reward_std:.3f}")
         print(f"Advantages - Mean: {adv_mean:.3f}, Std: {adv_std:.3f}")
 
         # Display sample response
@@ -593,8 +663,9 @@ class MLXGRPOTrainer:
 
         # 4. Compute loss and gradients
         try:
-            # Compute gradients
-            loss_and_grad_fn = mx.compile(nn.value_and_grad(self.model, loss_fn))
+            # Compute gradients (with optional compilation)
+            grad_fn_raw = nn.value_and_grad(self.model, loss_fn)
+            loss_and_grad_fn = mx.compile(grad_fn_raw) if self.args.use_compile else grad_fn_raw
             (loss, (policy_reward, kl_div)), grads = loss_and_grad_fn()
 
             # Accumulate grads
@@ -657,7 +728,13 @@ class MLXGRPOTrainer:
 
     def train(self):
         """Enhanced training loop with proper logging and checkpointing"""
-        print(f"Starting training with {self.total_steps} total steps")
+        print(f"Starting training: {self.total_batches} batches/epoch × {self.args.num_epochs} epochs = {self.total_updates} optimizer updates")
+
+        # Open JSONL log file
+        log_path = os.path.join(self.args.output_dir, "training_log.jsonl")
+        os.makedirs(self.args.output_dir, exist_ok=True)
+        log_file = open(log_path, "w")
+        print(f"Logging metrics to {log_path}")
 
         for epoch in range(self.args.num_epochs):
             indices = list(range(len(self.train_dataset)))
@@ -671,25 +748,56 @@ class MLXGRPOTrainer:
                 # Training step
                 loss, policy_reward, kl_div = self.train_step(batch)
 
+                # Log to JSONL after each update
+                if (self.step % self.args.gradient_accumulation_steps) == 0:
+                    current_update = self.step // self.args.gradient_accumulation_steps
+                    current_lr = self.lr_schedule(current_update)
+                    log_entry = {
+                        "update": current_update,
+                        "batch": self.step,
+                        "epoch": epoch,
+                        "lr": float(current_lr),
+                        "loss": float(loss),
+                        "policy_reward": float(policy_reward),
+                        "kl": float(kl_div),
+                        "reward_mean": self.last_reward_mean,
+                        "reward_std": self.last_reward_std,
+                    }
+                    if self.last_em_score is not None:
+                        log_entry["em_score"] = self.last_em_score
+                    log_file.write(json.dumps(log_entry) + "\n")
+                    log_file.flush()
+
                 # Logging
                 if self.step % self.args.logging_steps == 0:
+                    current_update = self.step // self.args.gradient_accumulation_steps
                     print(
-                        "Epoch {epoch}, Step {step}/{total}, Loss: {loss:.4f}, "
-                        "Policy Reward: {pr:.4f}, KL: {kl:.4f}".format(
+                        "Epoch {epoch}, Batch {step}/{total_batches}, Update {update}/{total_updates}, "
+                        "Loss: {loss:.4f}, Policy Reward: {pr:.4f}, KL: {kl:.4f}".format(
                             epoch=epoch,
                             step=self.step,
-                            total=self.total_steps,
+                            total_batches=self.total_batches * self.args.num_epochs,
+                            update=current_update,
+                            total_updates=self.total_updates,
                             loss=float(loss),
                             pr=float(policy_reward),
                             kl=float(kl_div)
                         )
                     )
                 
+                # Run evaluation
+                if self.step > 0 and self.step % self.args.eval_steps == 0:
+                    em_score = self.evaluate()
+
                 # Save checkpoint
                 if self.step % self.args.save_steps == 0:
                     checkpoint_path = os.path.join(self.args.output_dir, f"checkpoint-{self.step}")
                     self.save_checkpoint(checkpoint_path)
                     print(f"Saved checkpoint to {checkpoint_path}")
+
+        # Close log file
+        log_file.close()
+        print(f"\nTraining log saved to {log_path}")
 
 def main():
     """Main training function"""
@@ -734,6 +842,13 @@ def main():
     print(f"  KL Coefficient: {config.kl_coeff}")
     print("="*80)
 
+    # Load dataset
+    print("\nLoading dataset...")
+    dataset = get_gsm8k_questions(split='train')
+    eval_dataset = get_gsm8k_questions(split='test')
+    print(f"Train dataset loaded: {len(dataset)} examples")
+    print(f"Test dataset loaded: {len(eval_dataset)} examples")
+
     # Load model and tokenizer
     print("\nLoading model and tokenizer...")
     model, tokenizer = load_model(model_name)
@@ -752,7 +867,8 @@ def main():
             int_reward_func,
         ],
         args=config,
-        train_dataset=dataset
+        train_dataset=dataset,
+        eval_dataset=eval_dataset
     )
     print("Trainer initialized")
 
