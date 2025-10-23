@@ -4,7 +4,9 @@ from mlx.utils import tree_flatten, tree_unflatten, tree_map
 from datasets import load_dataset, Dataset
 from transformers import AutoTokenizer
 from mlx_lm import load as mlx_load, generate as mlx_generate
+from mlx_lm.sample_utils import make_sampler, make_logits_processors
 import os
+import json
 from dataclasses import dataclass
 from typing import List, Optional, Dict, Any, Tuple
 import math
@@ -73,24 +75,33 @@ def correctness_reward_func(prompts, completions, answer, **kwargs) -> list[floa
     responses = [completion[0]['content'] for completion in completions]
     q = prompts[0][-1]['content']
     extracted_responses = [extract_xml_answer(r) for r in responses]
-    print('-' * 20, f"Question:\n{q}", f"\nAnswer:\n{answer[0]}", f"\nResponse:\n{responses[0]}", f"\nExtracted:\n{extracted_responses[0]}")
-    return [2.0 if r == a else 0.0 for r, a in zip(extracted_responses, answer)]
+    gold = answer[0] if isinstance(answer, (list, tuple)) else answer
+    print('-' * 20, f"Question:\n{q}", f"\nAnswer:\n{gold}", f"\nResponse:\n{responses[0]}", f"\nExtracted:\n{extracted_responses[0]}")
+    return [2.0 if r == gold else 0.0 for r in extracted_responses]
 
 def int_reward_func(completions, **kwargs) -> list[float]:
     responses = [completion[0]['content'] for completion in completions]
     extracted_responses = [extract_xml_answer(r) for r in responses]
-    return [0.5 if r.isdigit() else 0.0 for r in extracted_responses]
+    scores = []
+    for r in extracted_responses:
+        try:
+            _ = int(r.strip())
+            scores.append(0.5)
+        except Exception:
+            scores.append(0.0)
+    return scores
 
 def strict_format_reward_func(completions, **kwargs) -> list[float]:
-    pattern = r"^<reasoning>\n.*?\n</reasoning>\n<answer>\n.*?\n</answer>\n$"
+    # Require full XML shell; allow arbitrary newlines/whitespace
+    pattern = r"^\s*<reasoning>.*?</reasoning>\s*<answer>.*?</answer>\s*$"
     responses = [completion[0]["content"] for completion in completions]
-    matches = [re.match(pattern, r) for r in responses]
+    matches = [re.search(pattern, r, flags=re.DOTALL) for r in responses]
     return [0.5 if match else 0.0 for match in matches]
 
 def soft_format_reward_func(completions, **kwargs) -> list[float]:
     pattern = r"<reasoning>.*?</reasoning>\s*<answer>.*?</answer>"
     responses = [completion[0]["content"] for completion in completions]
-    matches = [re.match(pattern, r) for r in responses]
+    matches = [re.search(pattern, r, flags=re.DOTALL) for r in responses]
     return [0.5 if match else 0.0 for match in matches]
 
 def count_xml(text) -> float:
@@ -138,7 +149,8 @@ training_args = {
 
 def load_model(model_name):
     """Load model and tokenizer using MLX-LM"""
-    model, tokenizer = mlx_load(model_name)
+    # Allow remote code/tokenizer templates when needed (e.g., Qwen chat)
+    model, tokenizer = mlx_load(model_name, tokenizer_config={"trust_remote_code": True})
 
     # Ensure pad token is set
     if tokenizer.pad_token is None:
@@ -284,19 +296,25 @@ class MLXGRPOTrainer:
         return self.args.learning_rate * lr_schedule
     
     def format_prompt(self, messages: List[Dict[str, str]]) -> str:
-        """Format messages into a prompt string"""
-        formatted = ""
-        for msg in messages:
-            role = msg['role']
-            content = msg['content']
-            if role == 'system':
-                formatted += f"System: {content}\n\n"
-            elif role == 'user':
-                formatted += f"User: {content}\n\n"
-            elif role == 'assistant':
-                formatted += f"Assistant: {content}\n\n"
-        formatted += "Assistant: "  # Prompt for assistant response
-        return formatted
+        """
+        Build the prompt using the tokenizer's chat template (e.g., Qwen),
+        falling back to the legacy string format if unavailable.
+        """
+        try:
+            return self.tokenizer.apply_chat_template(messages, add_generation_prompt=True)
+        except Exception:
+            formatted = ""
+            for msg in messages:
+                role = msg['role']
+                content = msg['content']
+                if role == 'system':
+                    formatted += f"System: {content}\n\n"
+                elif role == 'user':
+                    formatted += f"User: {content}\n\n"
+                elif role == 'assistant':
+                    formatted += f"Assistant: {content}\n\n"
+            formatted += "Assistant: "
+            return formatted
 
     def generate_responses(self, batch):
         """
@@ -314,6 +332,12 @@ class MLXGRPOTrainer:
         responses: List[str] = []
         old_log_probs: List[mx.array] = []
 
+        # Sampler & processors (temperature/top-p via sampler)
+        sampler = make_sampler(self.args.temperature, top_p=0.95, min_p=0.0, min_tokens_to_keep=1)
+        logits_processors = make_logits_processors(
+            None, repetition_penalty=None, repetition_context_size=None
+        )
+
         for i in range(self.args.num_generations):
             try:
                 # CRITICAL: Generate with model_old (not self.model)
@@ -322,8 +346,9 @@ class MLXGRPOTrainer:
                     self.tokenizer,
                     prompt=formatted_prompt,
                     max_tokens=self.args.max_new_tokens,
-                    temp=self.args.temperature,
-                    verbose=False
+                    sampler=sampler,
+                    logits_processors=logits_processors,
+                    verbose=False,
                 )
                 responses.append(output)
 
@@ -410,19 +435,23 @@ class MLXGRPOTrainer:
     def save_checkpoint(self, path: str):
         """Save model checkpoint"""
         os.makedirs(path, exist_ok=True)
-        
-        # Save model weights
-        mx.save(os.path.join(path, "model.safetensors"), self.model)
-        
-        # Save optimizer state
-        mx.save(os.path.join(path, "optimizer.safetensors"), self.optimizer.state)
-        
-        # Save training state
+        # Save model weights (.safetensors via Module.save_weights)
+        if isinstance(self.model, nn.Module):
+            self.model.save_weights(os.path.join(path, "model.safetensors"))
+        elif isinstance(self.model, dict) and 'model' in self.model:
+            self.model['model'].save_weights(os.path.join(path, "model.safetensors"))
+
+        # Save optimizer state as safetensors (dict[str, mx.array])
+        if hasattr(self.optimizer, "state"):
+            mx.save_safetensors(os.path.join(path, "optimizer.safetensors"), self.optimizer.state)
+
+        # Save training state as JSON (non-array metadata)
         training_state = {
-            "step": self.step,
-            "args": self.args.__dict__
+            "step": int(self.step),
+            "args": self.args.__dict__,
         }
-        mx.save(os.path.join(path, "trainer_state.safetensors"), training_state)
+        with open(os.path.join(path, "trainer_state.json"), "w") as f:
+            json.dump(training_state, f, indent=2)
 
     def compute_grpo_loss(self, policy_model, ref_model, prompt: str,
                           responses: List[str], advantages: mx.array,
@@ -545,9 +574,7 @@ class MLXGRPOTrainer:
         # 4. Compute loss and gradients
         try:
             # Compute gradients
-            loss_and_grad_fn = nn.value_and_grad(
-                self.model, loss_fn, has_aux=True
-            )
+            loss_and_grad_fn = nn.value_and_grad(self.model, loss_fn)
             (loss, (policy_reward, kl_div)), grads = loss_and_grad_fn()
 
             # Gradient clipping
