@@ -1,15 +1,12 @@
 [project]
 name = "mlx-grpo"
-version = "0.1.0"
-description = "Add your description here"
+version = "0.2.0"
+description = "A pure MLX-based training pipeline for fine-tuning LLMs using GRPO on Apple Silicon"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "datasets>=3.2.0",
-    "mlx-lm>=0.21.1",
-    "mlx>=0.22.0",
-    "peft>=0.14.0",
-    "torch>=2.6.0",
-    "transformers>=4.48.2",
-    "trl>=0.14.0",
+    "datasets>=4.2.0",
+    "mlx-lm>=0.28.3",
+    "mlx>=0.29.3",
+    "transformers>=4.56.2",
 ]
