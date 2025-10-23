@@ -236,6 +236,11 @@ class MLXGRPOConfig:
     eval_samples: int = 200  # Number of samples to use for evaluation
     seed: int = 0
     use_compile: bool = True  # Toggle mx.compile for gradient computation
+    # --- evaluation & logging ---
+    eval_every_updates: int = 25       # set 0 to disable periodic eval
+    eval_subset_size: int = 200
+    eval_max_new_tokens: int = 128
+    log_jsonl: bool = True
 
 class MLXGRPOTrainer:
     def __init__(self, model, tokenizer, reward_funcs, args: MLXGRPOConfig, train_dataset, eval_dataset=None):
@@ -278,6 +283,11 @@ class MLXGRPOTrainer:
 
         # Gradient accumulation
         self._accum_grads = None
+        # Optimizer update counter (distinct from batch steps)
+        self.update_step = 0
+        # Logging path
+        os.makedirs(self.args.output_dir, exist_ok=True)
+        self.log_path = os.path.join(self.args.output_dir, "training_log.jsonl")
 
         # Tracking for logging
         self.last_reward_mean = 0.0
@@ -306,6 +316,18 @@ class MLXGRPOTrainer:
                     formatted += f"Assistant: {content}\n\n"
             formatted += "Assistant: "
             return formatted
+
+    # -------------------------
+    # JSONL logger (append)
+    # -------------------------
+    def _log_jsonl(self, record: Dict[str, Any]):
+        if not self.args.log_jsonl:
+            return
+        try:
+            with open(self.log_path, "a") as f:
+                f.write(json.dumps(record) + "\n")
+        except Exception as e:
+            print(f"Logging failed: {e}")
 
     def generate_responses(self, batch):
         """
@@ -462,7 +484,65 @@ class MLXGRPOTrainer:
         advantages = (total_rewards - mean_reward) / (std_reward + 1e-8)
 
         return advantages, total_rewards
-    
+
+    # -------------------------
+    # Quick EM evaluator
+    # -------------------------
+    def evaluate_em(self, dataset, num_samples: int) -> float:
+        """Exact‑match on a small subset of GSM8K using the current policy."""
+        if num_samples <= 0:
+            return 0.0
+        idxs = list(range(len(dataset)))
+        random.shuffle(idxs)
+        subset = idxs[:min(num_samples, len(dataset))]
+
+        # Greedy-ish sampler (temperature 0.0)
+        sampler = make_sampler(0.0, top_p=1.0, min_p=0.0, min_tokens_to_keep=1)
+        logits_processors = make_logits_processors(None, repetition_penalty=None, repetition_context_size=None)
+
+        def maybe_int(s: Optional[str]):
+            if s is None:
+                return None
+            try:
+                return int(s.strip())
+            except Exception:
+                return None
+
+        correct = 0
+        total = 0
+        for i in subset:
+            ex = dataset[i]
+            gold = ex.get("answer", None)
+            if gold is None:
+                continue
+            messages = ex["prompt"]
+            try:
+                prompt = self.format_prompt(messages)
+                out = mlx_generate(
+                    self.model, self.tokenizer,
+                    prompt=prompt,
+                    max_tokens=self.args.eval_max_new_tokens,
+                    sampler=sampler,
+                    logits_processors=logits_processors,
+                    verbose=False,
+                )
+                # Trim after </answer> if present
+                if "</answer>" in out:
+                    out = out.split("</answer>", 1)[0] + "</answer>"
+                pred = extract_xml_answer(out)
+                # Numeric‑aware EM
+                gi, pi = maybe_int(gold), maybe_int(pred)
+                if gi is not None and pi is not None:
+                    match = (gi == pi)
+                else:
+                    match = (pred.strip() == gold.strip())
+                correct += int(match)
+                total += 1
+            except Exception as e:
+                # Skip problematic samples in eval
+                continue
+        return (correct / total) if total > 0 else 0.0
+
     def save_checkpoint(self, path: str):
         """Save model checkpoint"""
         os.makedirs(path, exist_ok=True)
@@ -698,6 +778,30 @@ class MLXGRPOTrainer:
                     f"GradNorm: {float(grad_norm):.4f}, "
                     f"Policy Reward: {float(policy_reward):.4f}, KL: {float(kl_div):.4f}"
                 )
+                # Bump optimizer update counter and log
+                self.update_step += 1
+                lr_now = float(self.lr_schedule(self.update_step))
+                # Log JSONL
+                self._log_jsonl({
+                    "update": int(self.update_step),
+                    "batch_step": int(self.step + 1),
+                    "lr": lr_now,
+                    "loss": float(loss),
+                    "grad_norm": float(grad_norm),
+                    "policy_reward": float(policy_reward),
+                    "kl": float(kl_div),
+                    "reward_mean": float(self.last_reward_mean),
+                    "reward_std": float(self.last_reward_std),
+                })
+                # Periodic EM evaluation on a small subset
+                if self.args.eval_every_updates > 0 and (self.update_step % self.args.eval_every_updates == 0):
+                    em = self.evaluate_em(self.train_dataset, self.args.eval_subset_size)
+                    print(f"[Eval] EM@{self.args.eval_subset_size}: {em:.3f}")
+                    self._log_jsonl({
+                        "update": int(self.update_step),
+                        "em_subset": int(self.args.eval_subset_size),
+                        "em": float(em),
+                    })
 
         except Exception as e:
             print(f"Training step failed: {e}")
