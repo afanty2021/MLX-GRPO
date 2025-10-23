@@ -10,7 +10,7 @@ import json
 from dataclasses import dataclass
 from typing import List, Optional, Dict, Any, Tuple
 import math
-from mlx.optimizers import Adam
+from mlx.optimizers import Adam, cosine_decay, clip_grad_norm
 import re
 import copy
 import inspect
@@ -76,6 +76,8 @@ def correctness_reward_func(prompts, completions, answer, **kwargs) -> list[floa
     q = prompts[0][-1]['content']
     extracted_responses = [extract_xml_answer(r) for r in responses]
     gold = answer[0] if isinstance(answer, (list, tuple)) else answer
+    if gold is None:
+        return [0.0] * len(extracted_responses)
     print('-' * 20, f"Question:\n{q}", f"\nAnswer:\n{gold}", f"\nResponse:\n{responses[0]}", f"\nExtracted:\n{extracted_responses[0]}")
     return [2.0 if r == gold else 0.0 for r in extracted_responses]
 
@@ -105,18 +107,16 @@ def soft_format_reward_func(completions, **kwargs) -> list[float]:
     return [0.5 if match else 0.0 for match in matches]
 
 def count_xml(text) -> float:
-    count = 0.0
-    if text.count("<reasoning>\n") == 1:
-        count += 0.125
-    if text.count("\n</reasoning>\n") == 1:
-        count += 0.125
-    if text.count("\n<answer>\n") == 1:
-        count += 0.125
-        count -= len(text.split("\n</answer>\n")[-1]) * 0.001
-    if text.count("\n</answer>") == 1:
-        count += 0.125
-        count -= (len(text.split("\n</answer>")[-1]) - 1) * 0.001
-    return count
+    score = 0.0
+    if re.search(r"<reasoning>.*?</reasoning>", text, flags=re.DOTALL):
+        score += 0.25
+    if re.search(r"<answer>.*?</answer>", text, flags=re.DOTALL):
+        score += 0.25
+    # Penalize trailing junk after </answer>
+    end = re.search(r"</answer>(.*)$", text, flags=re.DOTALL)
+    if end:
+        score -= len(end.group(1).strip()) * 0.001
+    return score
 
 def xmlcount_reward_func(completions, **kwargs) -> list[float]:
     contents = [completion[0]["content"] for completion in completions]
@@ -185,7 +185,8 @@ def calculate_log_probs_single(model, tokenizer, prompt: str, completion: str) -
 
     # Create full sequence
     full_tokens = prompt_tokens + completion_tokens
-    input_ids = mx.array(full_tokens)[None, :]  # Add batch dimension
+    # Be explicit about dtype: embeddings consume integer IDs.
+    input_ids = mx.array(full_tokens, dtype=mx.int32)[None, :]  # Add batch dimension
 
     # Forward pass through the supplied model to obtain token logits.
     if isinstance(model, nn.Module):
@@ -250,6 +251,7 @@ class MLXGRPOConfig:
     weight_decay: float = 0.0
     lr_scheduler_type: str = 'cosine'
     save_steps: int = 100
+    seed: int = 0
 
 class MLXGRPOTrainer:
     def __init__(self, model, tokenizer, reward_funcs, args: MLXGRPOConfig, train_dataset):
@@ -263,23 +265,27 @@ class MLXGRPOTrainer:
         # 1. model - current trainable policy (π_θ)
         # 2. model_old - policy that generates responses (π_θ_old), synced periodically
         # 3. ref_model - original pretrained model (π_ref), never updated
-        self.model_old = copy.deepcopy(model)  # Starts same as model
-        self.ref_model = copy.deepcopy(model)  # Never changes
+        self.model_old = copy.deepcopy(model)  # πθ_old
+        self.ref_model = copy.deepcopy(model)  # π_ref
+        try:
+            # Safe: these models are not trained
+            nn.quantize(self.model_old, group_size=64, bits=4)
+            nn.quantize(self.ref_model, group_size=64, bits=4)
+            print("Quantized model_old and ref_model to 4-bit for faster rollouts.")
+        except Exception as e:
+            print(f"Quantization skipped: {e}")
 
-        # Initialize optimizer with correct API
-        # Get trainable parameters
-        if isinstance(model, nn.Module):
-            params = model.trainable_parameters()
-        elif isinstance(model, dict) and 'model' in model:
-            params = model['model'].trainable_parameters()
-        else:
-            params = {}
-
-        self.optimizer = Adam(learning_rate=args.learning_rate)
-
+        # Calculate total steps for LR schedule
         self.step = 0
         self.total_steps = len(train_dataset) * args.num_epochs
         self.update_every = 10  # Sync model_old every N steps
+
+        # LR schedule
+        self.lr_schedule = cosine_decay(args.learning_rate, self.total_steps)
+        self.optimizer = Adam(learning_rate=self.lr_schedule)
+
+        # Gradient accumulation
+        self._accum_grads = None
         
     def _get_scheduler(self):
         """Implements cosine learning rate schedule"""
@@ -338,35 +344,65 @@ class MLXGRPOTrainer:
             None, repetition_penalty=None, repetition_context_size=None
         )
 
-        for i in range(self.args.num_generations):
-            try:
-                # CRITICAL: Generate with model_old (not self.model)
-                output = mlx_generate(
-                    self.model_old,  # Use old model for generation!
-                    self.tokenizer,
-                    prompt=formatted_prompt,
-                    max_tokens=self.args.max_new_tokens,
-                    sampler=sampler,
-                    logits_processors=logits_processors,
-                    verbose=False,
-                )
-                responses.append(output)
+        # Try batch generation for better performance
+        # Note: mlx_generate may support batch generation depending on version
+        try:
+            # Attempt batch generation with repeated prompts
+            prompts = [formatted_prompt] * self.args.num_generations
+            outputs = mlx_generate(
+                self.model_old,
+                self.tokenizer,
+                prompt=prompts,
+                max_tokens=self.args.max_new_tokens,
+                sampler=sampler,
+                logits_processors=logits_processors,
+                verbose=False
+            )
+            # Check if outputs is iterable (batch generation succeeded)
+            if isinstance(outputs, (list, tuple)):
+                responses = list(outputs)
+            else:
+                # Single output, fall back to loop
+                raise TypeError("Batch generation not supported")
 
-                # CRITICAL: Compute old_log_probs during generation
-                # This is π_θ_old(o_i|q) - probability under the old policy
-                log_prob = calculate_log_probs_single(
-                    self.model_old,
-                    self.tokenizer,
-                    formatted_prompt,
-                    output
-                )
-                old_log_probs.append(log_prob)
+            # Compute log probs for all responses
+            old_log_probs = [
+                calculate_log_probs_single(self.model_old, self.tokenizer, formatted_prompt, out)
+                for out in responses
+            ]
+        except (TypeError, Exception) as e:
+            # Fall back to sequential generation
+            responses = []
+            old_log_probs = []
+            for i in range(self.args.num_generations):
+                try:
+                    # CRITICAL: Generate with model_old (not self.model)
+                    output = mlx_generate(
+                        self.model_old,  # Use old model for generation!
+                        self.tokenizer,
+                        prompt=formatted_prompt,
+                        max_tokens=self.args.max_new_tokens,
+                        sampler=sampler,
+                        logits_processors=logits_processors,
+                        verbose=False,
+                    )
+                    responses.append(output)
 
-            except Exception as e:
-                print(f"Generation {i} failed: {e}")
-                # Fallback to empty response with zero log prob
-                responses.append("")
-                old_log_probs.append(mx.array(0.0))
+                    # CRITICAL: Compute old_log_probs during generation
+                    # This is π_θ_old(o_i|q) - probability under the old policy
+                    log_prob = calculate_log_probs_single(
+                        self.model_old,
+                        self.tokenizer,
+                        formatted_prompt,
+                        output
+                    )
+                    old_log_probs.append(log_prob)
+
+                except Exception as e:
+                    print(f"Generation {i} failed: {e}")
+                    # Fallback to empty response with zero log prob
+                    responses.append("")
+                    old_log_probs.append(mx.array(0.0))
 
         # Stack the rollout log-probabilities into a single tensor to align with
         # the vectorised GRPO loss calculation.
@@ -574,30 +610,38 @@ class MLXGRPOTrainer:
         # 4. Compute loss and gradients
         try:
             # Compute gradients
-            loss_and_grad_fn = nn.value_and_grad(self.model, loss_fn)
+            loss_and_grad_fn = mx.compile(nn.value_and_grad(self.model, loss_fn))
             (loss, (policy_reward, kl_div)), grads = loss_and_grad_fn()
 
-            # Gradient clipping
-            grad_norm = mx.sqrt(sum(mx.sum(g * g) for g in tree_flatten(grads)[0]))
-            if grad_norm > self.args.max_grad_norm:
-                grads = tree_map(lambda g: g * self.args.max_grad_norm / grad_norm, grads)
+            # Accumulate grads
+            if self._accum_grads is None:
+                self._accum_grads = grads
+            else:
+                self._accum_grads = tree_map(lambda a, b: a + b, self._accum_grads, grads)
 
-            # 5. Update parameters
-            self.optimizer.update(self.model, grads)
+            do_update = ((self.step + 1) % self.args.gradient_accumulation_steps) == 0
             eval_items = []
-            if isinstance(self.model, nn.Module):
-                eval_items.append(self.model.trainable_parameters())
-            elif isinstance(self.model, dict) and 'model' in self.model:
-                eval_items.append(self.model['model'].trainable_parameters())
-            if hasattr(self.optimizer, "state"):
-                eval_items.append(self.optimizer.state)
-            if eval_items:
-                mx.eval(*eval_items)
+            if do_update:
+                # Scale, clip, update
+                scaled = tree_map(lambda g: g / self.args.gradient_accumulation_steps, self._accum_grads)
+                scaled, grad_norm = clip_grad_norm(scaled, self.args.max_grad_norm)
+                self.optimizer.update(self.model, scaled)
+                self._accum_grads = None
+                # collect items to eval when we actually update
+                if isinstance(self.model, nn.Module):
+                    eval_items.append(self.model.trainable_parameters())
+                elif isinstance(self.model, dict) and 'model' in self.model:
+                    eval_items.append(self.model['model'].trainable_parameters())
+                if hasattr(self.optimizer, "state"):
+                    eval_items.append(self.optimizer.state)
+                if eval_items:
+                    mx.eval(*eval_items)
 
-            print(
-                f"Loss: {float(loss):.4f}, Grad Norm: {float(grad_norm):.4f}, "
-                f"Policy Reward: {float(policy_reward):.4f}, KL: {float(kl_div):.4f}"
-            )
+            if do_update:
+                print(
+                    f"Loss: {float(loss):.4f}, "
+                    f"Policy Reward: {float(policy_reward):.4f}, KL: {float(kl_div):.4f}"
+                )
 
         except Exception as e:
             print(f"Training step failed: {e}")
@@ -683,8 +727,13 @@ def main():
         batch_size=1,
         gradient_accumulation_steps=4,
         save_steps=100,
-        logging_steps=1
+        logging_steps=1,
+        seed=0
     )
+
+    # Seed for reproducibility
+    mx.random.seed(config.seed)
+    random.seed(config.seed)
 
     print(f"\nTraining Configuration:")
     print(f"  Learning Rate: {config.learning_rate}")

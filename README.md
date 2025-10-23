@@ -34,9 +34,9 @@
    ```bash
    pip install uv
    ```
-   Then, install the remaining dependencies using your preferred tool (e.g., Poetry) or via pip:
+   Then, install the remaining dependencies (pure MLX path):
    ```bash
-   pip install mlx>=0.22 mlx-lm>=0.10 torch>=2.0 datasets>=2.10 transformers>=4.40 peft>=0.2 trl>=0.3 uv>=0.0.1
+   pip install "mlx>=0.29.3" "mlx-lm>=0.28.3" "datasets>=4.2.0" "transformers>=4.56.2" "uv>=0.0.1"
    ```
 
 ## Usage
@@ -46,13 +46,17 @@ To start training using the GRPO pipeline (pure MLX), simply run:
 ```bash
 uv run mlx-grpo.py
 ```
-This command uses the `uv` CLI runner, which reads the configuration from `pyproject.toml` and runs the `train_grpo.py` script.
+This command executes `mlx-grpo.py` using the `uv` runner and the dependencies in `pyproject.toml`.
 
 ## Project Structure
 
-- **train_grpo.py:** Main training script that loads the GSM8K dataset, defines reward functions, loads the model (using MLX‑LM), and runs GRPO training.
+- **mlx-grpo.py:** Main training script that loads the GSM8K dataset, defines reward functions, loads the model (using MLX‑LM), and runs GRPO training.
 - **pyproject.toml:** Contains project metadata and dependencies.
 - Additional modules and files can be added as the project evolves.
+
+## Reproducibility
+
+For reproducible sampling, MLX uses a global PRNG that is seeded at the start of training. The seed can be configured via `MLXGRPOConfig.seed` (default: 0). Set `mx.random.seed(config.seed)` to ensure consistent generation across runs.
 
 ## Contributing
 
