@@ -2,7 +2,6 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_flatten, tree_unflatten, tree_map
 from datasets import load_dataset, Dataset
-from transformers import AutoTokenizer
 from mlx_lm import load as mlx_load, generate as mlx_generate
 from mlx_lm.sample_utils import make_sampler, make_logits_processors
 import os
@@ -130,19 +129,6 @@ model_name = "Qwen/Qwen2.5-1.5B-Instruct"
 output_dir = "outputs/Qwen-1.5B-MLX-GRPO"
 run_name = "Qwen-1.5B-MLX-GRPO-gsm8k"
 
-# Update training args to be MLX compatible
-training_args = {
-    'output_dir': output_dir,
-    'run_name': run_name,
-    'learning_rate': 5e-6,
-    'batch_size': 1,
-    'gradient_accumulation_steps': 4,
-    'num_epochs': 1,
-    'warmup_ratio': 0.1,
-    'max_grad_norm': 0.1,
-    'logging_steps': 1
-}
-
 # Note: MLX-LM has built-in LoRA support via command-line tools
 # For training with LoRA, you can use: python -m mlx_lm.lora --model <model> --train
 # This implementation focuses on full model fine-tuning with GRPO
@@ -221,9 +207,6 @@ def calculate_log_probs_single(model, tokenizer, prompt: str, completion: str) -
     else:
         return mx.array(0.0)
 
-# Load model and tokenizer
-model, tokenizer = load_model(model_name)
-
 # -------------------------------------------------------------------
 # Initialize and Run GRPO Training (Pure MLX)
 # -------------------------------------------------------------------
@@ -280,27 +263,18 @@ class MLXGRPOTrainer:
         self.total_steps = len(train_dataset) * args.num_epochs
         self.update_every = 10  # Sync model_old every N steps
 
-        # LR schedule
-        self.lr_schedule = cosine_decay(args.learning_rate, self.total_steps)
+        # LR schedule with warmup + cosine
+        base = cosine_decay(args.learning_rate, self.total_steps)
+        warmup_steps = max(1, int(self.total_steps * self.args.warmup_ratio))
+        def schedule(step: int):
+            warm = step / warmup_steps if step < warmup_steps else 1.0
+            return base(step) * warm
+        self.lr_schedule = schedule
         self.optimizer = Adam(learning_rate=self.lr_schedule)
 
         # Gradient accumulation
         self._accum_grads = None
-        
-    def _get_scheduler(self):
-        """Implements cosine learning rate schedule"""
-        warmup_steps = int(self.total_steps * self.args.warmup_ratio)
-        
-        def lr_schedule(step):
-            # Linear warmup
-            if step < warmup_steps:
-                return float(step) / float(max(1, warmup_steps))
-            # Cosine decay
-            progress = float(step - warmup_steps) / float(max(1, self.total_steps - warmup_steps))
-            return 0.5 * (1.0 + math.cos(math.pi * progress))
-            
-        return self.args.learning_rate * lr_schedule
-    
+
     def format_prompt(self, messages: List[Dict[str, str]]) -> str:
         """
         Build the prompt using the tokenizer's chat template (e.g., Qwen),
@@ -360,7 +334,13 @@ class MLXGRPOTrainer:
             )
             # Check if outputs is iterable (batch generation succeeded)
             if isinstance(outputs, (list, tuple)):
-                responses = list(outputs)
+                # Trim at the end tag if present to reduce junk after </answer>
+                responses = []
+                for out in outputs:
+                    cut = out
+                    if "</answer>" in cut:
+                        cut = cut.split("</answer>", 1)[0] + "</answer>"
+                    responses.append(cut)
             else:
                 # Single output, fall back to loop
                 raise TypeError("Batch generation not supported")
@@ -386,7 +366,11 @@ class MLXGRPOTrainer:
                         logits_processors=logits_processors,
                         verbose=False,
                     )
-                    responses.append(output)
+                    # Trim at the end tag if present to reduce junk after </answer>
+                    cut = output
+                    if "</answer>" in cut:
+                        cut = cut.split("</answer>", 1)[0] + "</answer>"
+                    responses.append(cut)
 
                     # CRITICAL: Compute old_log_probs during generation
                     # This is π_θ_old(o_i|q) - probability under the old policy
@@ -394,7 +378,7 @@ class MLXGRPOTrainer:
                         self.model_old,
                         self.tokenizer,
                         formatted_prompt,
-                        output
+                        cut
                     )
                     old_log_probs.append(log_prob)
 
@@ -640,6 +624,7 @@ class MLXGRPOTrainer:
             if do_update:
                 print(
                     f"Loss: {float(loss):.4f}, "
+                    f"GradNorm: {float(grad_norm):.4f}, "
                     f"Policy Reward: {float(policy_reward):.4f}, KL: {float(kl_div):.4f}"
                 )
 
@@ -661,6 +646,11 @@ class MLXGRPOTrainer:
                 self.model_old = copy.deepcopy(self.model)
             elif isinstance(self.model, dict):
                 self.model_old = copy.deepcopy(self.model)
+            # Re-quantize rollout policy to keep memory/speed benefits
+            try:
+                nn.quantize(self.model_old, group_size=64, bits=4)
+            except Exception as e:
+                print(f"Re-quantization of model_old skipped: {e}")
             mx.eval(self.model_old)  # Ensure copy is complete
 
         return loss, policy_reward, kl_div
