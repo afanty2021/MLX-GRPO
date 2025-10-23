@@ -1,19 +1,16 @@
 import mlx.core as mx
 import mlx.nn as nn
-from mlx.utils import tree_map
+from mlx.utils import tree_flatten, tree_unflatten, tree_map
 from datasets import load_dataset, Dataset
-from transformers import AutoTokenizer  # Not using AutoModelForCausalLM anymore
-from peft import LoraConfig
-from trl import GRPOConfig, GRPOTrainer
+from transformers import AutoTokenizer
 from mlx_lm import load as mlx_load, generate as mlx_generate
-import numpy as np
 import os
 from dataclasses import dataclass
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 import math
-from mlx.optimizers import Adam  # Use the new optimizer module
+from mlx.optimizers import Adam
 import re
-import inspect  # ensure inspect is imported
+import copy
 
 # -------------------------------------------------------------------
 # Dataset Preparation and Formatting
@@ -133,29 +130,79 @@ training_args = {
     'logging_steps': 1
 }
 
-peft_config = LoraConfig(
-    r=16,
-    lora_alpha=64,
-    target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "up_proj", "down_proj", "gate_proj"],
-    task_type="CAUSAL_LM",
-    lora_dropout=0.05,
-)
+# Note: MLX-LM has built-in LoRA support via command-line tools
+# For training with LoRA, you can use: python -m mlx_lm.lora --model <model> --train
+# This implementation focuses on full model fine-tuning with GRPO
 
-# Replace the model loading section
 def load_model(model_name):
-    """Load model and tokenizer"""
+    """Load model and tokenizer using MLX-LM"""
     model, tokenizer = mlx_load(model_name)
-    tokenizer.pad_token = tokenizer.eos_token
 
-    # Fix: Add a forward function to the model dictionary so that it becomes callable.
-    def forward_fn(**tokens_dict):
-        # Call the apply_fn with the learned parameters from the model dictionary.
-        return model["apply_fn"](model["params"], **tokens_dict)
-    model["forward"] = forward_fn
+    # Ensure pad token is set
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.pad_token_id = tokenizer.eos_token_id
 
     return model, tokenizer
 
-# Update the model loading call
+def get_model_params(model):
+    """Extract trainable parameters from MLX model"""
+    # MLX-LM models are typically nn.Module instances or dicts
+    if isinstance(model, nn.Module):
+        return model.trainable_parameters()
+    elif isinstance(model, dict) and 'model' in model:
+        return model['model'].trainable_parameters()
+    else:
+        raise ValueError(f"Unexpected model type: {type(model)}")
+
+def calculate_log_probs_single(model, tokenizer, prompt: str, completion: str) -> mx.array:
+    """
+    Calculate log probability of a single completion given a prompt.
+    Used during generation phase to compute old_log_probs.
+
+    Returns the sum of log probabilities for all completion tokens.
+    """
+    # Tokenize prompt and completion separately to know boundaries
+    prompt_tokens = tokenizer.encode(prompt, add_special_tokens=False)
+    completion_tokens = tokenizer.encode(completion, add_special_tokens=False)
+
+    # Create full sequence
+    full_tokens = prompt_tokens + completion_tokens
+    input_ids = mx.array(full_tokens)[None, :]  # Add batch dimension
+
+    # Get model logits
+    if isinstance(model, nn.Module):
+        logits = model(input_ids)
+    elif isinstance(model, dict) and 'model' in model:
+        logits = model['model'](input_ids)
+    else:
+        raise ValueError(f"Unexpected model type: {type(model)}")
+
+    # Compute log probabilities using log_softmax
+    # Shape: [1, seq_len, vocab_size]
+    log_probs_full = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+
+    # Extract log probs for completion tokens
+    # log_probs_full[i] predicts token at position i+1
+    prompt_len = len(prompt_tokens)
+    completion_len = len(completion_tokens)
+
+    # Get log probs for positions that predict completion tokens
+    completion_log_probs = []
+    for i in range(completion_len):
+        pos = prompt_len - 1 + i  # Position in sequence
+        if pos < len(full_tokens) - 1:
+            next_token_id = full_tokens[pos + 1]
+            log_prob = log_probs_full[0, pos, next_token_id]
+            completion_log_probs.append(log_prob)
+
+    # Sum log probabilities
+    if len(completion_log_probs) > 0:
+        return mx.sum(mx.stack(completion_log_probs))
+    else:
+        return mx.array(0.0)
+
+# Load model and tokenizer
 model, tokenizer = load_model(model_name)
 
 # -------------------------------------------------------------------
@@ -166,19 +213,23 @@ class MLXGRPOConfig:
     """Configuration class for MLX GRPO training"""
     output_dir: str
     run_name: str
-    learning_rate: float = 5e-6
+    learning_rate: float = 1e-6
     batch_size: int = 1
     gradient_accumulation_steps: int = 4
     num_epochs: int = 1
     warmup_ratio: float = 0.1
     max_grad_norm: float = 0.1
     logging_steps: int = 1
-    num_generations: int = 16
-    max_prompt_length: int = 256
-    max_completion_length: int = 786
+    num_generations: int = 64  # DeepSeekMath uses 64 samples per prompt
+    max_prompt_length: int = 512
+    max_completion_length: int = 1024  # DeepSeekMath uses 1024
+    max_new_tokens: int = 512
+    temperature: float = 0.7
+    clip_eps: float = 0.2  # PPO clipping epsilon
+    kl_coeff: float = 0.0  # KL coefficient (can set to 0.04 as in DeepSeek)
     adam_beta1: float = 0.9
-    adam_beta2: float = 0.99
-    weight_decay: float = 0.1
+    adam_beta2: float = 0.999
+    weight_decay: float = 0.0
     lr_scheduler_type: str = 'cosine'
     save_steps: int = 100
 
@@ -189,12 +240,28 @@ class MLXGRPOTrainer:
         self.reward_funcs = reward_funcs
         self.args = args
         self.train_dataset = train_dataset
-        
-        # Enhanced optimizer configuration
-        self.optimizer = Adam(args.learning_rate, model.parameters())
-        
+
+        # CRITICAL: Three models as per article
+        # 1. model - current trainable policy (π_θ)
+        # 2. model_old - policy that generates responses (π_θ_old), synced periodically
+        # 3. ref_model - original pretrained model (π_ref), never updated
+        self.model_old = copy.deepcopy(model)  # Starts same as model
+        self.ref_model = copy.deepcopy(model)  # Never changes
+
+        # Initialize optimizer with correct API
+        # Get trainable parameters
+        if isinstance(model, nn.Module):
+            params = model.trainable_parameters()
+        elif isinstance(model, dict) and 'model' in model:
+            params = model['model'].trainable_parameters()
+        else:
+            params = {}
+
+        self.optimizer = Adam(learning_rate=args.learning_rate)
+
         self.step = 0
         self.total_steps = len(train_dataset) * args.num_epochs
+        self.update_every = 10  # Sync model_old every N steps
         
     def _get_scheduler(self):
         """Implements cosine learning rate schedule"""
@@ -210,60 +277,111 @@ class MLXGRPOTrainer:
             
         return self.args.learning_rate * lr_schedule
     
+    def format_prompt(self, messages: List[Dict[str, str]]) -> str:
+        """Format messages into a prompt string"""
+        formatted = ""
+        for msg in messages:
+            role = msg['role']
+            content = msg['content']
+            if role == 'system':
+                formatted += f"System: {content}\n\n"
+            elif role == 'user':
+                formatted += f"User: {content}\n\n"
+            elif role == 'assistant':
+                formatted += f"Assistant: {content}\n\n"
+        formatted += "Assistant: "  # Prompt for assistant response
+        return formatted
+
     def generate_responses(self, batch):
-        """Generate responses for a batch of prompts"""
+        """
+        Generate multiple responses for a prompt using model_old.
+        Also computes old_log_probs for each response.
+
+        Returns:
+            responses: List of generated strings
+            old_log_probs: List of log probability values (mx.array)
+            formatted_prompt: The formatted prompt string
+        """
+        messages = batch['prompt']
+        formatted_prompt = self.format_prompt(messages)
+
         responses = []
-        
-        def generate_fn():
-            # Format the prompt from the messages
-            messages = batch['prompt']
-            formatted_prompt = ""
-            for msg in messages:
-                if msg['role'] == 'system':
-                    formatted_prompt += f"System: {msg['content']}\n"
-                elif msg['role'] == 'user':
-                    formatted_prompt += f"User: {msg['content']}\n"
-                elif msg['role'] == 'assistant':
-                    formatted_prompt += f"Assistant: {msg['content']}\n"
-            
-            output = mlx_generate(
-                self.model,
-                self.tokenizer,
-                formatted_prompt
-            )
-            # If output is already a dict with key "content", wrap it in a nested list.
-            if isinstance(output, dict) and "content" in output:
-                return [[ output ]]
-            else:
-                return [[ {"content": output} ]]
-            
-        for _ in range(self.args.num_generations):
-            response = generate_fn()
-            responses.append(response)
-        
-        return responses
+        old_log_probs = []
+
+        for i in range(self.args.num_generations):
+            try:
+                # CRITICAL: Generate with model_old (not self.model)
+                output = mlx_generate(
+                    self.model_old,  # Use old model for generation!
+                    self.tokenizer,
+                    prompt=formatted_prompt,
+                    max_tokens=self.args.max_new_tokens,
+                    temp=self.args.temperature,
+                    verbose=False
+                )
+                responses.append(output)
+
+                # CRITICAL: Compute old_log_probs during generation
+                # This is π_θ_old(o_i|q) - probability under the old policy
+                log_prob = calculate_log_probs_single(
+                    self.model_old,
+                    self.tokenizer,
+                    formatted_prompt,
+                    output
+                )
+                old_log_probs.append(log_prob)
+
+            except Exception as e:
+                print(f"Generation {i} failed: {e}")
+                # Fallback to empty response with zero log prob
+                responses.append("")
+                old_log_probs.append(mx.array(0.0))
+
+        return responses, old_log_probs, formatted_prompt
     
-    def compute_rewards(self, batch, responses):
-        """Compute rewards using all reward functions"""
-        all_rewards = []
-        
-        for reward_fn in self.reward_funcs:
-            rewards = reward_fn(
-                prompts=batch['prompt'],
-                completions=responses,
-                answer=batch.get('answer')
-            )
-            all_rewards.append(mx.array(rewards))
-            
-        # Combine rewards - mean across all reward functions
-        combined_rewards = mx.mean(mx.stack(all_rewards), axis=0)
-        
-        # Normalize rewards
-        mean_reward = mx.mean(combined_rewards)
-        std_reward = mx.std(combined_rewards)
-        normalized_rewards = (combined_rewards - mean_reward) / (std_reward + 1e-8)
-        
-        return normalized_rewards
+    def compute_rewards(self, batch, responses: List[str]) -> mx.array:
+        """
+        Compute rewards for all responses using reward functions.
+        Returns normalized advantages based on group mean.
+        """
+        # Prepare completions in the format expected by reward functions
+        # Each response needs to be wrapped in the format reward functions expect
+        completions = [[{"content": response}] for response in responses]
+
+        rewards = []
+        for response, completion in zip(responses, completions):
+            total_reward = 0.0
+
+            # Apply each reward function
+            for reward_fn in self.reward_funcs:
+                try:
+                    # Call reward function with appropriate arguments
+                    result = reward_fn(
+                        prompts=[batch['prompt']],
+                        completions=[completion],
+                        answer=[batch.get('answer', '')]
+                    )
+                    # Sum up rewards if it returns a list
+                    if isinstance(result, list):
+                        total_reward += sum(result)
+                    else:
+                        total_reward += float(result)
+                except Exception as e:
+                    print(f"Reward function failed: {e}")
+                    pass
+
+            rewards.append(total_reward)
+
+        rewards = mx.array(rewards)
+
+        # GRPO: Compute advantages relative to group mean (baseline)
+        mean_reward = mx.mean(rewards)
+        std_reward = mx.std(rewards)
+
+        # Normalize: A_i = (R_i - mean(G)) / (std(G) + eps)
+        advantages = (rewards - mean_reward) / (std_reward + 1e-8)
+
+        return advantages, rewards
     
     def save_checkpoint(self, path: str):
         """Save model checkpoint"""
@@ -282,89 +400,152 @@ class MLXGRPOTrainer:
         }
         mx.save(os.path.join(path, "trainer_state.safetensors"), training_state)
 
-    def train_step(self, batch):
-        """Performs a single training step using GRPO."""
-        # Generate multiple responses for each prompt
-        responses = self.generate_responses(batch)
-        
-        # Compute rewards for each prompt.
-        # Retrieve the reference answer from the batch (if available)
-        reference = batch.get("answer", None)
-        rewards = []
-        for completions in responses:
-            reward = 0
-            for f in self.reward_funcs:
-                sig = inspect.signature(f)
-                call_args = {}
-                # Build a dictionary based on expected parameter names.
-                for param in sig.parameters:
-                    if param in ("completions", "response", "prompts"):
-                        call_args[param] = completions
-                    elif param == "answer":
-                        call_args[param] = reference
-                    elif param == "batch":
-                        call_args[param] = batch
-                if not call_args:
-                    # Fallback: assume the function accepts a single positional argument.
-                    result = f(completions)
-                else:
-                    result = f(**call_args)
-                if isinstance(result, list):
-                    result = sum(result)
-                reward += result
-            rewards.append(reward)
-        
-        # Convert rewards to mx array
-        rewards = mx.array(rewards)
-        
-        # Normalize rewards
-        rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
-        
-        # Compute loss and update model
-        def loss_fn(model):
-            # Tokenize the formatted prompt from the batch.
-            messages = batch.get('prompt', [])
-            formatted_prompt = ""
-            for msg in messages:
-                if msg['role'] == 'system':
-                    formatted_prompt += f"System: {msg['content']}\n"
-                elif msg['role'] == 'user':
-                    formatted_prompt += f"User: {msg['content']}\n"
-                elif msg['role'] == 'assistant':
-                    formatted_prompt += f"Assistant: {msg['content']}\n"
-            tokens_dict = self.tokenizer.encode_plus(
-                    formatted_prompt,
-                    return_tensors="np",
-                    padding=True
+    def compute_grpo_loss(self, prompt: str, responses: List[str],
+                          advantages: mx.array, old_log_probs: List[mx.array]):
+        """
+        Compute GRPO loss following the article's implementation.
+
+        Args:
+            prompt: The formatted prompt string
+            responses: List of generated completions
+            advantages: Normalized advantages (A_i)
+            old_log_probs: Pre-computed log probs from model_old
+
+        Returns:
+            loss: Total loss (to be minimized)
+            policy_reward_mean: Mean policy reward (for logging)
+            kl_div_mean: Mean KL divergence (for logging)
+        """
+        policy_rewards = []
+        kl_divs = []
+
+        for response, advantage, old_log_prob in zip(responses, advantages, old_log_probs):
+            try:
+                # Compute log_prob with current model (π_θ)
+                log_prob_current = calculate_log_probs_single(
+                    self.model, self.tokenizer, prompt, response
                 )
-            # Call model using keyword arguments. Check different possibilities for invoking the model.
-            if callable(model):
-                output = model(**tokens_dict)
-            elif isinstance(model, dict) and "forward" in model and callable(model["forward"]):
-                output = model["forward"](**tokens_dict)
-            elif hasattr(model, "forward") and callable(model.forward):
-                output = model.forward(**tokens_dict)
-            elif hasattr(model, "apply") and callable(model.apply):
-                output = model.apply(**tokens_dict)
-            else:
-                raise ValueError("Model is not callable and has no forward or apply method.")
 
-            # If output is a tuple/list, assume that the logits are the first element.
-            if isinstance(output, (list, tuple)):
-                logits = output[0]
-            else:
-                logits = output
+                # Compute log_prob with reference model (π_ref)
+                log_prob_ref = calculate_log_probs_single(
+                    self.ref_model, self.tokenizer, prompt, response
+                )
 
-            loss = -mx.mean(rewards * logits)
+                # PPO-clip objective: ratio = π_θ / π_θ_old
+                ratio = mx.exp(log_prob_current - old_log_prob)
+                clipped_ratio = mx.clip(ratio, 1.0 - self.args.clip_eps, 1.0 + self.args.clip_eps)
+
+                # Policy reward = min(ratio * A, clip(ratio) * A)
+                policy_reward = mx.minimum(ratio * advantage, clipped_ratio * advantage)
+                policy_rewards.append(policy_reward)
+
+                # KL penalty: D_KL(π_θ || π_ref) = r - log(r) - 1
+                # where r = π_ref / π_θ
+                log_ratio_for_kl = log_prob_ref - log_prob_current
+                ratio_for_kl = mx.exp(log_ratio_for_kl)
+                kl_div = ratio_for_kl - log_ratio_for_kl - 1
+                kl_divs.append(kl_div)
+
+            except Exception as e:
+                print(f"Loss computation failed: {e}")
+                policy_rewards.append(mx.array(0.0))
+                kl_divs.append(mx.array(0.0))
+
+        # Average over all responses
+        policy_reward_mean = mx.mean(mx.stack(policy_rewards))
+        kl_div_mean = mx.mean(mx.stack(kl_divs))
+
+        # Total objective: maximize (policy_reward - β * kl_div)
+        # Return negative for minimization
+        loss = -mx.mean(mx.stack([pr - self.args.kl_coeff * kl
+                                   for pr, kl in zip(policy_rewards, kl_divs)]))
+
+        return loss, policy_reward_mean, kl_div_mean
+
+    def train_step(self, batch):
+        """
+        Performs a single training step using GRPO (following the article).
+
+        Steps:
+        1. Generate N responses using model_old and compute old_log_probs
+        2. Compute rewards and advantages (relative to group mean)
+        3. Compute GRPO loss (uses model, ref_model, and old_log_probs)
+        4. Update model parameters
+        5. Periodically sync model_old from model
+        """
+        print(f"\n{'='*60}")
+        print(f"Training step {self.step + 1}")
+        print(f"{'='*60}")
+
+        # 1. Generate multiple responses with model_old
+        responses, old_log_probs, formatted_prompt = self.generate_responses(batch)
+        print(f"Generated {len(responses)} responses using model_old")
+
+        # 2. Compute rewards and advantages
+        advantages, rewards = self.compute_rewards(batch, responses)
+        print(f"Rewards - Mean: {float(mx.mean(rewards)):.3f}, Std: {float(mx.std(rewards)):.3f}")
+        print(f"Advantages - Mean: {float(mx.mean(advantages)):.3f}, Std: {float(mx.std(advantages)):.3f}")
+
+        # Display sample response
+        if len(responses) > 0:
+            print(f"\n--- Sample Response (Reward: {float(rewards[0]):.3f}) ---")
+            print(responses[0][:200] + "..." if len(responses[0]) > 200 else responses[0])
+            print(f"---")
+
+        # 3. Define loss function for gradient computation
+        def loss_fn(params):
+            """Loss function that computes GRPO objective"""
+            loss, policy_reward, kl_div = self.compute_grpo_loss(
+                formatted_prompt,
+                responses,
+                advantages,
+                old_log_probs
+            )
             return loss
-            
-        loss, grads = mx.value_and_grad(loss_fn)(self.model)
-        
-        # Apply gradients with gradient clipping
-        grads = mx.tree_map(lambda g: mx.clip(g, -self.args.max_grad_norm, self.args.max_grad_norm), grads)
-        self.optimizer.update(self.model, grads)
+
+        # 4. Compute loss and gradients
+        try:
+            # Get current model parameters
+            if isinstance(self.model, nn.Module):
+                params = self.model.trainable_parameters()
+            elif isinstance(self.model, dict) and 'model' in self.model:
+                params = self.model['model'].trainable_parameters()
+            else:
+                raise ValueError(f"Unexpected model type: {type(self.model)}")
+
+            # Compute gradients
+            loss_and_grad_fn = mx.value_and_grad(loss_fn)
+            loss, grads = loss_and_grad_fn(params)
+
+            # Gradient clipping
+            grad_norm = mx.sqrt(sum(mx.sum(g * g) for g in tree_flatten(grads)[0]))
+            if grad_norm > self.args.max_grad_norm:
+                grads = tree_map(lambda g: g * self.args.max_grad_norm / grad_norm, grads)
+
+            # 5. Update parameters
+            self.optimizer.update(self.model, grads)
+            mx.eval(self.model)  # Ensure updates are applied
+
+            print(f"Loss: {float(loss):.4f}, Grad Norm: {float(grad_norm):.4f}")
+
+        except Exception as e:
+            print(f"Training step failed: {e}")
+            import traceback
+            traceback.print_exc()
+            loss = mx.array(0.0)
+
         self.step += 1
-        
+
+        # 6. Sync model_old from model periodically (as per article)
+        if self.step % self.update_every == 0:
+            print(f"\n*** Syncing model_old weights from model (step {self.step}) ***")
+            # Copy current model to model_old
+            if isinstance(self.model, nn.Module):
+                self.model_old = copy.deepcopy(self.model)
+            elif isinstance(self.model, dict):
+                self.model_old = copy.deepcopy(self.model)
+            mx.eval(self.model_old)  # Ensure copy is complete
+
         return loss
 
     def train(self):
@@ -389,35 +570,75 @@ class MLXGRPOTrainer:
                     print(f"Saved checkpoint to {checkpoint_path}")
 
 def main():
-    # Initialize configuration with all parameters
+    """Main training function"""
+    print("="*80)
+    print("MLX-GRPO Training Pipeline")
+    print("="*80)
+    print(f"Model: {model_name}")
+    print(f"Output Dir: {output_dir}")
+    print(f"Dataset: GSM8K (train split)")
+    print("="*80)
+
+    # Initialize configuration with DeepSeek-inspired parameters
     config = MLXGRPOConfig(
-        output_dir="output",
-        run_name="mlx-grpo-run",
-        num_generations=16,
-        max_prompt_length=256,
-        max_completion_length=786
+        output_dir=output_dir,
+        run_name=run_name,
+        learning_rate=1e-6,  # DeepSeek uses 1e-6
+        num_generations=64,  # DeepSeek uses 64 samples per prompt
+        max_prompt_length=512,
+        max_completion_length=1024,  # DeepSeek uses 1024
+        max_new_tokens=512,
+        temperature=0.7,
+        clip_eps=0.2,
+        kl_coeff=0.0,  # Can set to 0.04 if needed
+        num_epochs=1,
+        batch_size=1,
+        gradient_accumulation_steps=4,
+        save_steps=100,
+        logging_steps=1
     )
-    
+
+    print(f"\nTraining Configuration:")
+    print(f"  Learning Rate: {config.learning_rate}")
+    print(f"  Generations per Prompt: {config.num_generations}")
+    print(f"  Max New Tokens: {config.max_new_tokens}")
+    print(f"  Temperature: {config.temperature}")
+    print(f"  Clip Epsilon: {config.clip_eps}")
+    print(f"  KL Coefficient: {config.kl_coeff}")
+    print("="*80)
+
     # Load model and tokenizer
+    print("\nLoading model and tokenizer...")
     model, tokenizer = load_model(model_name)
-    
+    print(f"Model loaded successfully")
+    print(f"Model type: {type(model)}")
+
     # Initialize trainer
+    print("\nInitializing GRPO trainer...")
     trainer = MLXGRPOTrainer(
         model=model,
         tokenizer=tokenizer,
         reward_funcs=[
+            correctness_reward_func,  # Most important - put first
             xmlcount_reward_func,
             soft_format_reward_func,
-            strict_format_reward_func,
             int_reward_func,
-            correctness_reward_func
         ],
         args=config,
         train_dataset=dataset
     )
-    
+    print("Trainer initialized")
+
     # Start training
+    print("\n" + "="*80)
+    print("Starting GRPO Training")
+    print("="*80)
     trainer.train()
+
+    print("\n" + "="*80)
+    print("Training Complete!")
+    print(f"Model saved to: {output_dir}")
+    print("="*80)
 
 if __name__ == "__main__":
     main()
