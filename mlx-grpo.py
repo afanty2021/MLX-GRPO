@@ -11,6 +11,8 @@ import math
 from mlx.optimizers import Adam
 import re
 import copy
+import inspect
+import random
 
 # -------------------------------------------------------------------
 # Dataset Preparation and Formatting
@@ -156,11 +158,14 @@ def get_model_params(model):
         raise ValueError(f"Unexpected model type: {type(model)}")
 
 def calculate_log_probs_single(model, tokenizer, prompt: str, completion: str) -> mx.array:
-    """
-    Calculate log probability of a single completion given a prompt.
-    Used during generation phase to compute old_log_probs.
+    """Return ``log p(o_i | q)`` for a single completion.
 
-    Returns the sum of log probabilities for all completion tokens.
+    The article computes the likelihood ratio between the trainable policy and
+    the frozen rollout policy using complete reasoning traces.  To mirror that
+    behaviour we feed the concatenated prompt + completion through the model
+    and sum the token log probabilities for the completion span only.  The
+    helper works for either ``nn.Module`` models or the dictionary-wrapped
+    format returned by :mod:`mlx_lm`.
     """
     # Tokenize prompt and completion separately to know boundaries
     prompt_tokens = tokenizer.encode(prompt, add_special_tokens=False)
@@ -170,7 +175,7 @@ def calculate_log_probs_single(model, tokenizer, prompt: str, completion: str) -
     full_tokens = prompt_tokens + completion_tokens
     input_ids = mx.array(full_tokens)[None, :]  # Add batch dimension
 
-    # Get model logits
+    # Forward pass through the supplied model to obtain token logits.
     if isinstance(model, nn.Module):
         logits = model(input_ids)
     elif isinstance(model, dict) and 'model' in model:
@@ -178,16 +183,17 @@ def calculate_log_probs_single(model, tokenizer, prompt: str, completion: str) -
     else:
         raise ValueError(f"Unexpected model type: {type(model)}")
 
-    # Compute log probabilities using log_softmax
-    # Shape: [1, seq_len, vocab_size]
-    log_probs_full = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+    # Convert logits into log-probabilities over the vocabulary for every
+    # timestep.  ``nn.log_softmax`` provides the numerically stable
+    # implementation used throughout the GRPO derivation.
+    log_probs_full = nn.log_softmax(logits, axis=-1)
 
     # Extract log probs for completion tokens
     # log_probs_full[i] predicts token at position i+1
     prompt_len = len(prompt_tokens)
     completion_len = len(completion_tokens)
 
-    # Get log probs for positions that predict completion tokens
+    # Extract log-probabilities that correspond to the completion tokens only.
     completion_log_probs = []
     for i in range(completion_len):
         pos = prompt_len - 1 + i  # Position in sequence
@@ -196,7 +202,7 @@ def calculate_log_probs_single(model, tokenizer, prompt: str, completion: str) -
             log_prob = log_probs_full[0, pos, next_token_id]
             completion_log_probs.append(log_prob)
 
-    # Sum log probabilities
+    # Sum the completion log-probabilities to obtain log p(o_i | q).
     if len(completion_log_probs) > 0:
         return mx.sum(mx.stack(completion_log_probs))
     else:
@@ -299,14 +305,14 @@ class MLXGRPOTrainer:
 
         Returns:
             responses: List of generated strings
-            old_log_probs: List of log probability values (mx.array)
+            old_log_probs: Array of log probability values (mx.array)
             formatted_prompt: The formatted prompt string
         """
         messages = batch['prompt']
         formatted_prompt = self.format_prompt(messages)
 
-        responses = []
-        old_log_probs = []
+        responses: List[str] = []
+        old_log_probs: List[mx.array] = []
 
         for i in range(self.args.num_generations):
             try:
@@ -337,51 +343,69 @@ class MLXGRPOTrainer:
                 responses.append("")
                 old_log_probs.append(mx.array(0.0))
 
-        return responses, old_log_probs, formatted_prompt
+        # Stack the rollout log-probabilities into a single tensor to align with
+        # the vectorised GRPO loss calculation.
+        if len(old_log_probs) > 0:
+            old_log_probs_arr = mx.stack(old_log_probs)
+        else:
+            old_log_probs_arr = mx.array([])
+
+        return responses, old_log_probs_arr, formatted_prompt
     
     def compute_rewards(self, batch, responses: List[str]) -> mx.array:
         """
         Compute rewards for all responses using reward functions.
         Returns normalized advantages based on group mean.
         """
-        # Prepare completions in the format expected by reward functions
-        # Each response needs to be wrapped in the format reward functions expect
+        if len(responses) == 0:
+            return mx.zeros((0,)), mx.zeros((0,))
+
+        # Prepare completions in the format expected by reward functions.  Each
+        # completion is wrapped in the structure ``[{"content": text}]`` that
+        # the existing reward utilities consume.
         completions = [[{"content": response}] for response in responses]
 
-        rewards = []
-        for response, completion in zip(responses, completions):
-            total_reward = 0.0
+        # Accumulate rewards from every reward function defined for the run.
+        total_rewards = mx.zeros((len(responses),))
+        reward_context = {
+            "prompts": [batch["prompt"]],
+            "answer": [batch.get("answer", "")],
+        }
 
-            # Apply each reward function
-            for reward_fn in self.reward_funcs:
-                try:
-                    # Call reward function with appropriate arguments
-                    result = reward_fn(
-                        prompts=[batch['prompt']],
-                        completions=[completion],
-                        answer=[batch.get('answer', '')]
-                    )
-                    # Sum up rewards if it returns a list
-                    if isinstance(result, list):
-                        total_reward += sum(result)
-                    else:
-                        total_reward += float(result)
-                except Exception as e:
-                    print(f"Reward function failed: {e}")
-                    pass
+        for reward_fn in self.reward_funcs:
+            try:
+                # Inspect the callable signature to determine whether the
+                # reward expects the ``prompts`` or ``answer`` keyword
+                # arguments.  Functions defined in this file are permissive and
+                # accept **kwargs, but the check keeps the trainer robust if a
+                # custom reward omits them.
+                sig = inspect.signature(reward_fn)
+                kwargs: Dict[str, Any] = {}
+                if "prompts" in sig.parameters:
+                    kwargs["prompts"] = reward_context["prompts"]
+                if "answer" in sig.parameters:
+                    kwargs["answer"] = reward_context["answer"]
 
-            rewards.append(total_reward)
+                reward_values = reward_fn(completions=completions, **kwargs)
 
-        rewards = mx.array(rewards)
+                if not isinstance(reward_values, (list, tuple)):
+                    reward_values = [reward_values] * len(responses)
 
-        # GRPO: Compute advantages relative to group mean (baseline)
-        mean_reward = mx.mean(rewards)
-        std_reward = mx.std(rewards)
+                # Convert the return value into an array so that we can combine
+                # contributions from multiple reward functions.
+                reward_array = mx.array(reward_values)
+                total_rewards = total_rewards + reward_array
+            except Exception as e:
+                print(f"Reward function failed: {e}")
+                continue
 
-        # Normalize: A_i = (R_i - mean(G)) / (std(G) + eps)
-        advantages = (rewards - mean_reward) / (std_reward + 1e-8)
+        # GRPO advantage normalisation: subtract the group mean and divide by
+        # the group standard deviation to obtain ``A_i``.
+        mean_reward = mx.mean(total_rewards)
+        std_reward = mx.std(total_rewards)
+        advantages = (total_rewards - mean_reward) / (std_reward + 1e-8)
 
-        return advantages, rewards
+        return advantages, total_rewards
     
     def save_checkpoint(self, path: str):
         """Save model checkpoint"""
@@ -400,8 +424,9 @@ class MLXGRPOTrainer:
         }
         mx.save(os.path.join(path, "trainer_state.safetensors"), training_state)
 
-    def compute_grpo_loss(self, prompt: str, responses: List[str],
-                          advantages: mx.array, old_log_probs: List[mx.array]):
+    def compute_grpo_loss(self, policy_model, ref_model, prompt: str,
+                          responses: List[str], advantages: mx.array,
+                          old_log_probs: mx.array):
         """
         Compute GRPO loss following the article's implementation.
 
@@ -416,49 +441,51 @@ class MLXGRPOTrainer:
             policy_reward_mean: Mean policy reward (for logging)
             kl_div_mean: Mean KL divergence (for logging)
         """
-        policy_rewards = []
-        kl_divs = []
+        if len(responses) == 0:
+            zero = mx.array(0.0)
+            return zero, zero, zero
 
-        for response, advantage, old_log_prob in zip(responses, advantages, old_log_probs):
+        # Evaluate log probabilities for each completion under the current
+        # policy and the frozen reference model.  The operations remain in the
+        # autograd graph so gradients flow back to ``policy_model``.
+        current_log_probs = []
+        ref_log_probs = []
+        for response in responses:
             try:
-                # Compute log_prob with current model (π_θ)
-                log_prob_current = calculate_log_probs_single(
-                    self.model, self.tokenizer, prompt, response
+                current_log_probs.append(
+                    calculate_log_probs_single(policy_model, self.tokenizer, prompt, response)
                 )
-
-                # Compute log_prob with reference model (π_ref)
-                log_prob_ref = calculate_log_probs_single(
-                    self.ref_model, self.tokenizer, prompt, response
+                ref_log_probs.append(
+                    calculate_log_probs_single(ref_model, self.tokenizer, prompt, response)
                 )
-
-                # PPO-clip objective: ratio = π_θ / π_θ_old
-                ratio = mx.exp(log_prob_current - old_log_prob)
-                clipped_ratio = mx.clip(ratio, 1.0 - self.args.clip_eps, 1.0 + self.args.clip_eps)
-
-                # Policy reward = min(ratio * A, clip(ratio) * A)
-                policy_reward = mx.minimum(ratio * advantage, clipped_ratio * advantage)
-                policy_rewards.append(policy_reward)
-
-                # KL penalty: D_KL(π_θ || π_ref) = r - log(r) - 1
-                # where r = π_ref / π_θ
-                log_ratio_for_kl = log_prob_ref - log_prob_current
-                ratio_for_kl = mx.exp(log_ratio_for_kl)
-                kl_div = ratio_for_kl - log_ratio_for_kl - 1
-                kl_divs.append(kl_div)
-
             except Exception as e:
-                print(f"Loss computation failed: {e}")
-                policy_rewards.append(mx.array(0.0))
-                kl_divs.append(mx.array(0.0))
+                print(f"Log prob computation failed: {e}")
+                current_log_probs.append(mx.array(0.0))
+                ref_log_probs.append(mx.array(0.0))
 
-        # Average over all responses
-        policy_reward_mean = mx.mean(mx.stack(policy_rewards))
-        kl_div_mean = mx.mean(mx.stack(kl_divs))
+        current_log_probs_arr = mx.stack(current_log_probs)
+        ref_log_probs_arr = mx.stack(ref_log_probs)
+        advantages_arr = mx.array(advantages)
+        old_log_probs_arr = mx.array(old_log_probs)
 
-        # Total objective: maximize (policy_reward - β * kl_div)
-        # Return negative for minimization
-        loss = -mx.mean(mx.stack([pr - self.args.kl_coeff * kl
-                                   for pr, kl in zip(policy_rewards, kl_divs)]))
+        # PPO-clip objective: ratio = π_θ / π_θ_old, clipped to the trust region
+        # [1-ε, 1+ε].  ``advantages`` acts as the fixed baseline-corrected signal.
+        ratio = mx.exp(current_log_probs_arr - old_log_probs_arr)
+        clipped_ratio = mx.clip(ratio, 1.0 - self.args.clip_eps, 1.0 + self.args.clip_eps)
+        policy_rewards = mx.minimum(ratio * advantages_arr, clipped_ratio * advantages_arr)
+
+        # KL penalty: D_KL(π_θ || π_ref) = r - log(r) - 1, with r = π_ref / π_θ.
+        log_ratio_for_kl = ref_log_probs_arr - current_log_probs_arr
+        ratio_for_kl = mx.exp(log_ratio_for_kl)
+        kl_divs = ratio_for_kl - log_ratio_for_kl - 1
+
+        policy_reward_mean = mx.mean(policy_rewards)
+        kl_div_mean = mx.mean(kl_divs)
+
+        # Total objective: maximize (policy_reward - β * KL).  We return the
+        # negated mean so that optimisers can minimise it directly.
+        objective = policy_rewards - self.args.kl_coeff * kl_divs
+        loss = -mx.mean(objective)
 
         return loss, policy_reward_mean, kl_div_mean
 
@@ -473,18 +500,28 @@ class MLXGRPOTrainer:
         4. Update model parameters
         5. Periodically sync model_old from model
         """
+        next_step = self.step + 1
         print(f"\n{'='*60}")
-        print(f"Training step {self.step + 1}")
+        print(f"Training step {next_step}")
         print(f"{'='*60}")
 
         # 1. Generate multiple responses with model_old
         responses, old_log_probs, formatted_prompt = self.generate_responses(batch)
-        print(f"Generated {len(responses)} responses using model_old")
+        num_responses = len(responses)
+        print(f"Generated {num_responses} responses using model_old")
+
+        if num_responses == 0:
+            print("No responses were produced; skipping update.")
+            return mx.array(0.0), mx.array(0.0), mx.array(0.0)
 
         # 2. Compute rewards and advantages
         advantages, rewards = self.compute_rewards(batch, responses)
-        print(f"Rewards - Mean: {float(mx.mean(rewards)):.3f}, Std: {float(mx.std(rewards)):.3f}")
-        print(f"Advantages - Mean: {float(mx.mean(advantages)):.3f}, Std: {float(mx.std(advantages)):.3f}")
+        reward_mean = float(mx.mean(rewards)) if num_responses > 0 else 0.0
+        reward_std = float(mx.std(rewards)) if num_responses > 0 else 0.0
+        adv_mean = float(mx.mean(advantages)) if num_responses > 0 else 0.0
+        adv_std = float(mx.std(advantages)) if num_responses > 0 else 0.0
+        print(f"Rewards - Mean: {reward_mean:.3f}, Std: {reward_std:.3f}")
+        print(f"Advantages - Mean: {adv_mean:.3f}, Std: {adv_std:.3f}")
 
         # Display sample response
         if len(responses) > 0:
@@ -493,29 +530,25 @@ class MLXGRPOTrainer:
             print(f"---")
 
         # 3. Define loss function for gradient computation
-        def loss_fn(params):
-            """Loss function that computes GRPO objective"""
+        def loss_fn(policy_model):
+            """Loss function that computes GRPO objective."""
             loss, policy_reward, kl_div = self.compute_grpo_loss(
+                policy_model,
+                self.ref_model,
                 formatted_prompt,
                 responses,
                 advantages,
                 old_log_probs
             )
-            return loss
+            return loss, (policy_reward, kl_div)
 
         # 4. Compute loss and gradients
         try:
-            # Get current model parameters
-            if isinstance(self.model, nn.Module):
-                params = self.model.trainable_parameters()
-            elif isinstance(self.model, dict) and 'model' in self.model:
-                params = self.model['model'].trainable_parameters()
-            else:
-                raise ValueError(f"Unexpected model type: {type(self.model)}")
-
             # Compute gradients
-            loss_and_grad_fn = mx.value_and_grad(loss_fn)
-            loss, grads = loss_and_grad_fn(params)
+            loss_and_grad_fn = nn.value_and_grad(
+                self.model, loss_fn, has_aux=True
+            )
+            (loss, (policy_reward, kl_div)), grads = loss_and_grad_fn()
 
             # Gradient clipping
             grad_norm = mx.sqrt(sum(mx.sum(g * g) for g in tree_flatten(grads)[0]))
@@ -524,15 +557,28 @@ class MLXGRPOTrainer:
 
             # 5. Update parameters
             self.optimizer.update(self.model, grads)
-            mx.eval(self.model)  # Ensure updates are applied
+            eval_items = []
+            if isinstance(self.model, nn.Module):
+                eval_items.append(self.model.trainable_parameters())
+            elif isinstance(self.model, dict) and 'model' in self.model:
+                eval_items.append(self.model['model'].trainable_parameters())
+            if hasattr(self.optimizer, "state"):
+                eval_items.append(self.optimizer.state)
+            if eval_items:
+                mx.eval(*eval_items)
 
-            print(f"Loss: {float(loss):.4f}, Grad Norm: {float(grad_norm):.4f}")
+            print(
+                f"Loss: {float(loss):.4f}, Grad Norm: {float(grad_norm):.4f}, "
+                f"Policy Reward: {float(policy_reward):.4f}, KL: {float(kl_div):.4f}"
+            )
 
         except Exception as e:
             print(f"Training step failed: {e}")
             import traceback
             traceback.print_exc()
             loss = mx.array(0.0)
+            policy_reward = mx.array(0.0)
+            kl_div = mx.array(0.0)
 
         self.step += 1
 
@@ -546,22 +592,37 @@ class MLXGRPOTrainer:
                 self.model_old = copy.deepcopy(self.model)
             mx.eval(self.model_old)  # Ensure copy is complete
 
-        return loss
+        return loss, policy_reward, kl_div
 
     def train(self):
         """Enhanced training loop with proper logging and checkpointing"""
         print(f"Starting training with {self.total_steps} total steps")
-        
+
         for epoch in range(self.args.num_epochs):
-            for batch in self.train_dataset:
-                self.step += 1
-                
+            indices = list(range(len(self.train_dataset)))
+            random.shuffle(indices)
+
+            for idx in indices:
+                batch = self.train_dataset[idx]
+                # Each batch corresponds to one prompt/answer pair.  Iterating
+                # through a shuffled epoch mimics the expectation over prompts
+                # discussed in the GRPO article.
                 # Training step
-                loss = self.train_step(batch)
-                
+                loss, policy_reward, kl_div = self.train_step(batch)
+
                 # Logging
                 if self.step % self.args.logging_steps == 0:
-                    print(f"Epoch {epoch}, Step {self.step}/{self.total_steps}, Loss: {loss.item():.4f}")
+                    print(
+                        "Epoch {epoch}, Step {step}/{total}, Loss: {loss:.4f}, "
+                        "Policy Reward: {pr:.4f}, KL: {kl:.4f}".format(
+                            epoch=epoch,
+                            step=self.step,
+                            total=self.total_steps,
+                            loss=float(loss),
+                            pr=float(policy_reward),
+                            kl=float(kl_div)
+                        )
+                    )
                 
                 # Save checkpoint
                 if self.step % self.args.save_steps == 0:
