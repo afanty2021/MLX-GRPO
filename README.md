@@ -41,16 +41,78 @@
 
 ## Usage
 
-To start training using the GRPO pipeline (pure MLX), simply run:
+> 🚀 **New to the config system?** Start with [QUICK_START.md](QUICK_START.md) for a 2-minute guide!
+
+### Run with a config file
+
+To start training using the GRPO pipeline (pure MLX), run:
 
 ```bash
+uv run mlx-grpo.py --config configs/default.toml
+```
+
+This command executes `mlx-grpo.py` using the `uv` runner and the dependencies in `pyproject.toml`.
+
+Override any setting from the command line without editing TOML:
+
+```bash
+uv run mlx-grpo.py --config configs/default.toml \
+  --set num_generations=64 \
+  --set max_new_tokens=512 \
+  --set learning_rate=5e-7
+```
+
+You can also set the config path via env var:
+
+```bash
+export MLX_GRPO_CONFIG=configs/my_run.toml
 uv run mlx-grpo.py
 ```
-This command executes `mlx-grpo.py` using the `uv` runner and the dependencies in `pyproject.toml`.
+
+If no config file is specified, the trainer will use built-in defaults from the `MLXGRPOConfig` dataclass.
+
+### Quick Examples
+
+**Smoke test (fast iteration):**
+```bash
+uv run mlx-grpo.py --config configs/smoke_test.toml
+```
+
+**Production run:**
+```bash
+uv run mlx-grpo.py --config configs/production.toml
+```
+
+**Custom tweaks on the fly:**
+```bash
+# Start with smoke test but increase generations
+uv run mlx-grpo.py --config configs/smoke_test.toml --set num_generations=16
+
+# Try a different model
+uv run mlx-grpo.py --config configs/default.toml \
+  --set model_name="mlx-community/Qwen2.5-3B-Instruct-4bit" \
+  --set output_dir="outputs/Qwen-3B-experiment"
+
+# Adjust learning rate
+uv run mlx-grpo.py --config configs/production.toml --set learning_rate=5e-7
+```
+
+## Configuration Files
+
+The `configs/` directory contains example TOML configuration files:
+
+- **default.toml:** Balanced configuration good for initial testing (8 generations, 128 tokens)
+- **smoke_test.toml:** Minimal settings for quick iteration (4 generations, 64 tokens)
+- **production.toml:** Full DeepSeek-inspired settings (64 generations, 512 tokens)
+
+You can create your own config files or modify existing ones to suit your needs.
+
+📖 **See [CONFIG_GUIDE.md](CONFIG_GUIDE.md) for complete documentation on configuration options and advanced usage.**
 
 ## Project Structure
 
 - **mlx-grpo.py:** Main training script that loads the GSM8K dataset, defines reward functions, loads the model (using MLX‑LM), and runs GRPO training.
+- **configs/:** Directory containing TOML configuration files for different training scenarios.
 - **pyproject.toml:** Contains project metadata and dependencies.
 - Additional modules and files can be added as the project evolves.
 

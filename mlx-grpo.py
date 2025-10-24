@@ -6,7 +6,7 @@ from mlx_lm import load as mlx_load, generate as mlx_generate
 from mlx_lm.sample_utils import make_sampler, make_logits_processors
 import os
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from typing import List, Optional, Dict, Any, Tuple
 import math
 from mlx.optimizers import Adam, cosine_decay, clip_grad_norm
@@ -14,6 +14,8 @@ import re
 import copy
 import inspect
 import random
+import argparse
+import tomllib  # Python 3.11+
 
 # -------------------------------------------------------------------
 # Dataset Preparation and Formatting
@@ -122,11 +124,6 @@ def xmlcount_reward_func(completions, **kwargs) -> list[float]:
 # -------------------------------------------------------------------
 # Model Configuration and Loading (Pure MLX)
 # -------------------------------------------------------------------
-# Use a model name (here using Qwen as an example)
-model_name = "Qwen/Qwen2.5-1.5B-Instruct"
-output_dir = "outputs/Qwen-1.5B-MLX-GRPO"
-run_name = "Qwen-1.5B-MLX-GRPO-gsm8k"
-
 # Note: MLX-LM has built-in LoRA support via command-line tools
 # For training with LoRA, you can use: python -m mlx_lm.lora --model <model> --train
 # This implementation focuses on full model fine-tuning with GRPO
@@ -142,16 +139,6 @@ def load_model(model_name):
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
     return model, tokenizer
-
-def get_model_params(model):
-    """Extract trainable parameters from MLX model"""
-    # MLX-LM models are typically nn.Module instances or dicts
-    if isinstance(model, nn.Module):
-        return model.trainable_parameters()
-    elif isinstance(model, dict) and 'model' in model:
-        return model['model'].trainable_parameters()
-    else:
-        raise ValueError(f"Unexpected model type: {type(model)}")
 
 def calculate_log_probs_single(model, tokenizer, prompt: str, completion: str) -> mx.array:
     """Return ``log p(o_i | q)`` for a single completion.
@@ -211,8 +198,10 @@ def calculate_log_probs_single(model, tokenizer, prompt: str, completion: str) -
 @dataclass
 class MLXGRPOConfig:
     """Configuration class for MLX GRPO training"""
-    output_dir: str
-    run_name: str
+    # Core run metadata
+    model_name: str = "Qwen/Qwen2.5-1.5B-Instruct"
+    output_dir: str = "outputs/Qwen-1.5B-MLX-GRPO"
+    run_name: str = "Qwen-1.5B-MLX-GRPO-gsm8k"
     learning_rate: float = 1e-6
     batch_size: int = 1
     gradient_accumulation_steps: int = 4
@@ -241,6 +230,52 @@ class MLXGRPOConfig:
     eval_subset_size: int = 200
     eval_max_new_tokens: int = 128
     log_jsonl: bool = True
+
+# -------------------------
+# Config helpers
+# -------------------------
+def _coerce_value(val: str, target):
+    """Best-effort string -> target type coercion."""
+    t = target
+    if t is bool:
+        return val.lower() in {"1", "true", "yes", "on"}
+    if t is int:
+        return int(val)
+    if t is float:
+        return float(val)
+    return val  # str or anything else: leave as-is
+
+def load_toml_config(path: str) -> Dict[str, Any]:
+    with open(path, "rb") as f:
+        return tomllib.load(f)
+
+def update_config_from_dict(cfg: MLXGRPOConfig, d: Dict[str, Any]) -> MLXGRPOConfig:
+    for k, v in d.items():
+        if hasattr(cfg, k):
+            setattr(cfg, k, v)
+    return cfg
+
+def apply_overrides(cfg: MLXGRPOConfig, overrides: list[str]) -> MLXGRPOConfig:
+    """Override fields with --set key=value (repeatable)."""
+    hints = MLXGRPOConfig.__annotations__
+    for item in overrides:
+        if "=" not in item:
+            print(f"[warn] ignoring override (no '='): {item}")
+            continue
+        key, val = item.split("=", 1)
+        key = key.strip()
+        val = val.strip()
+        if not hasattr(cfg, key):
+            print(f"[warn] unknown config key: {key}")
+            continue
+        target_type = hints.get(key, str)
+        try:
+            coerced = _coerce_value(val, target_type)
+        except Exception:
+            print(f"[warn] failed to coerce '{val}' to {target_type}; using string")
+            coerced = val
+        setattr(cfg, key, coerced)
+    return cfg
 
 class MLXGRPOTrainer:
     def __init__(self, model, tokenizer, reward_funcs, args: MLXGRPOConfig, train_dataset, eval_dataset=None):
@@ -891,37 +926,55 @@ class MLXGRPOTrainer:
 
 def main():
     """Main training function"""
-    print("="*80)
-    print("MLX-GRPO Training Pipeline")
-    print("="*80)
-    print(f"Model: {model_name}")
-    print(f"Output Dir: {output_dir}")
-    print(f"Dataset: GSM8K (train split)")
-    print("="*80)
-
-    # Initialize configuration with DeepSeek-inspired parameters
-    config = MLXGRPOConfig(
-        output_dir=output_dir,
-        run_name=run_name,
-        learning_rate=1e-6,  # DeepSeek uses 1e-6
-        num_generations=64,  # DeepSeek uses 64 samples per prompt
-        max_prompt_length=512,
-        max_completion_length=1024,  # DeepSeek uses 1024
-        max_new_tokens=512,
-        temperature=0.7,
-        clip_eps=0.2,
-        kl_coeff=0.0,  # Can set to 0.04 if needed
-        num_epochs=1,
-        batch_size=1,
-        gradient_accumulation_steps=4,
-        save_steps=100,
-        logging_steps=1,
-        seed=0
+    # ---------------- CLI / Config ----------------
+    parser = argparse.ArgumentParser(description="MLX-GRPO trainer")
+    parser.add_argument(
+        "--config",
+        default=os.environ.get("MLX_GRPO_CONFIG", "configs/test.toml"),
+        help="Path to a TOML config (default: configs/test.toml or $MLX_GRPO_CONFIG).",
     )
+    parser.add_argument(
+        "--set",
+        action="append",
+        default=[],
+        help="Override config keys as --set key=value (repeatable).",
+    )
+    args = parser.parse_args()
+
+    # Start with defaults, then load TOML if it exists, then apply overrides
+    config = MLXGRPOConfig()
+    if os.path.exists(args.config):
+        print(f"[config] loading {args.config}")
+        toml_cfg = load_toml_config(args.config)
+        # support either flat keys or a [mlx_grpo] table
+        flat = toml_cfg.get("mlx_grpo", toml_cfg)
+        config = update_config_from_dict(config, flat)
+    else:
+        print(f"[config] file not found, using defaults: {args.config}")
+    if args.set:
+        print(f"[config] applying overrides: {args.set}")
+        config = apply_overrides(config, args.set)
 
     # Seed for reproducibility
     mx.random.seed(config.seed)
     random.seed(config.seed)
+
+    # Resolve per-run output directory early to avoid clobbering
+    run_dir = os.path.join(config.output_dir, config.run_name)
+    os.makedirs(run_dir, exist_ok=True)
+    config.output_dir = run_dir
+
+    print("="*80)
+    print("MLX-GRPO Training Pipeline")
+    print("="*80)
+    print(f"Model: {config.model_name}")
+    print(f"Output Dir: {config.output_dir}")
+    print(f"Dataset: GSM8K (train split)")
+    print("="*80)
+
+    # Persist the resolved configuration for reproducibility
+    with open(os.path.join(config.output_dir, "config.resolved.json"), "w") as f:
+        json.dump(asdict(config), f, indent=2)
 
     print(f"\nTraining Configuration:")
     print(f"  Learning Rate: {config.learning_rate}")
@@ -941,7 +994,7 @@ def main():
 
     # Load model and tokenizer
     print("\nLoading model and tokenizer...")
-    model, tokenizer = load_model(model_name)
+    model, tokenizer = load_model(config.model_name)
     print(f"Model loaded successfully")
     print(f"Model type: {type(model)}")
 
@@ -970,7 +1023,7 @@ def main():
 
     print("\n" + "="*80)
     print("Training Complete!")
-    print(f"Model saved to: {output_dir}")
+    print(f"Model saved to: {config.output_dir}")
     print("="*80)
 
 if __name__ == "__main__":
