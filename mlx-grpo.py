@@ -206,6 +206,7 @@ class MLXGRPOConfig:
     batch_size: int = 1
     gradient_accumulation_steps: int = 4
     num_epochs: int = 1
+    max_train_samples: int = 0  # Limit training samples (0 = use all)
     warmup_ratio: float = 0.1
     max_grad_norm: float = 0.1
     logging_steps: int = 1
@@ -901,6 +902,11 @@ class MLXGRPOTrainer:
         for epoch in range(self.args.num_epochs):
             indices = list(range(len(self.train_dataset)))
             random.shuffle(indices)
+            
+            # Limit training samples if specified
+            if self.args.max_train_samples > 0:
+                indices = indices[:self.args.max_train_samples]
+                print(f"[INFO] Limiting training to {len(indices)} samples (max_train_samples={self.args.max_train_samples})")
 
             for idx in indices:
                 batch = self.train_dataset[idx]

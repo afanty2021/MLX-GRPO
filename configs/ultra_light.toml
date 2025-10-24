@@ -10,6 +10,7 @@ learning_rate = 1e-6
 num_epochs = 1
 batch_size = 1
 gradient_accumulation_steps = 1    # No accumulation
+max_train_samples = 50             # ← Only train on 50 examples!
 warmup_ratio = 0.1
 max_grad_norm = 0.1
 logging_steps = 1
@@ -27,6 +28,7 @@ eval_samples = 10                # ← Way less (was 50)
 eval_every_updates = 5           # ← More frequent
 eval_subset_size = 10            # ← Way less (was 50)
 eval_max_new_tokens = 32         # ← Shorter
+save_steps = 25                  # ← Save checkpoints every 25 steps
 log_jsonl = true
 
 # system
