@@ -6,8 +6,10 @@
 ## Features
 - **Pure MLX Integration:** Runs solely on Apple Silicon via MLX‑LM using the Metal backend.
 - **GRPO Training Pipeline:** Implements multiple reward functions (e.g., correctness, format-check, XML count) to optimize chain-of-thought responses.
+- **Universal Model Support:** Convert and use any Hugging Face model with built-in conversion utilities.
 - **Dataset Preprocessing:** Uses the GSM8K dataset to test multi-step reasoning.
 - **Modern Python Packaging:** Managed via `pyproject.toml` and launched using the `uv` CLI runner.
+- **Inference Tools:** Test models with generation, chat, and streaming modes.
 - **Easy to Run:** Start training with:
   
   ```bash
@@ -109,10 +111,55 @@ You can create your own config files or modify existing ones to suit your needs.
 
 📖 **See [CONFIG_GUIDE.md](CONFIG_GUIDE.md) for complete documentation on configuration options and advanced usage.**
 
+## Model Utilities
+
+The `utils/` directory provides powerful utilities for working with any Hugging Face model:
+
+### 🔄 Convert Any Model to MLX
+
+Convert any Hugging Face model to MLX format with optional quantization:
+
+```bash
+# Convert and quantize a model to 4-bit
+uv run python utils/convert_model.py \
+    --hf-path mistralai/Mistral-7B-Instruct-v0.3 \
+    --quantize
+
+# Use the converted model with GRPO
+uv run mlx-grpo.py \
+    --config configs/prod.toml \
+    --set model_name="mlx_model"
+```
+
+### 🚀 Run Inference
+
+Test your models with multiple inference modes:
+
+```bash
+# Single prompt generation
+uv run python utils/inference.py \
+    --model mlx_model \
+    --prompt "Explain quantum computing"
+
+# Interactive chat
+uv run python utils/inference.py \
+    --model mlx_model \
+    --chat
+
+# Streaming generation
+uv run python utils/inference.py \
+    --model mlx_model \
+    --prompt "Write a story" \
+    --stream
+```
+
+📖 **See [utils/README.md](utils/README.md) for complete documentation, examples, and advanced usage.**
+
 ## Project Structure
 
 - **mlx-grpo.py:** Main training script that loads the GSM8K dataset, defines reward functions, loads the model (using MLX‑LM), and runs GRPO training.
 - **configs/:** Directory containing TOML configuration files for different training scenarios.
+- **utils/:** Utility scripts for model conversion and inference. See [utils/README.md](utils/README.md).
 - **pyproject.toml:** Contains project metadata and dependencies.
 - Additional modules and files can be added as the project evolves.
 
