@@ -171,17 +171,39 @@ Examples:
         print(f'  python utils/inference.py --model {args.output_dir}')
         print("=" * 80)
         
+    except FileNotFoundError as e:
+        print("\n" + "=" * 80)
+        print("✗ Conversion failed - Model not compatible!")
+        print("=" * 80)
+        print(f"Error: {e}")
+        print("\nThis model is not in the standard transformers format that MLX-LM requires.")
+        print("\n✓ Try these WORKING models instead:")
+        print("  • Qwen/Qwen2.5-1.5B-Instruct    (small, fast)")
+        print("  • mistralai/Mistral-7B-Instruct-v0.3    (excellent quality)")
+        print("  • microsoft/phi-2    (compact & capable)")
+        print("  • deepseek-ai/deepseek-math-7b-instruct    (math specialist)")
+        print("\nOr use pre-converted MLX models:")
+        print("  Browse: https://huggingface.co/mlx-community")
+        print("  Example: mlx-community/Llama-3.2-3B-Instruct-4bit")
+        print("=" * 80)
+        import sys
+        sys.exit(1)
+        
     except Exception as e:
         print("\n" + "=" * 80)
         print("✗ Conversion failed!")
         print("=" * 80)
         print(f"Error: {e}")
         print("\nTroubleshooting:")
-        print("  - Ensure the model path is correct")
+        print("  - Ensure the model path is correct (check https://huggingface.co/)")
         print("  - Some models require --trust-remote-code flag")
         print("  - Qwen models need --eos-token '<|endoftext|>'")
         print("  - Check your internet connection")
         print("  - Ensure you have enough disk space")
+        print("\n✓ Recommended models that work:")
+        print("  • Qwen/Qwen2.5-1.5B-Instruct")
+        print("  • mistralai/Mistral-7B-Instruct-v0.3")
+        print("  • microsoft/phi-2")
         raise
 
 
