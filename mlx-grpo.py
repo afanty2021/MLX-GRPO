@@ -376,6 +376,9 @@ class MLXGRPOTrainer:
         """
         messages = batch['prompt']
         formatted_prompt = self.format_prompt(messages)
+        
+        # Nudge the model to follow the required format
+        formatted_prompt = formatted_prompt + "<reasoning>"
 
         responses: List[str] = []
         old_log_probs: List[mx.array] = []
@@ -680,7 +683,7 @@ class MLXGRPOTrainer:
         total = 0
 
         # Sampler & processors for evaluation (greedy, temp=0)
-        sampler = make_sampler(temperature=0.0, top_p=1.0, min_p=0.0, min_tokens_to_keep=1)
+        sampler = make_sampler(0.0, top_p=1.0, min_p=0.0, min_tokens_to_keep=1)
         logits_processors = make_logits_processors(
             None, repetition_penalty=None, repetition_context_size=None
         )
@@ -775,24 +778,38 @@ class MLXGRPOTrainer:
             print(f"---")
 
         # 3. Define loss function for gradient computation
-        def loss_fn(policy_model):
-            """Loss function that computes GRPO objective."""
-            loss, policy_reward, kl_div = self.compute_grpo_loss(
-                policy_model,
+        def loss_fn():
+            """Return only the scalar loss; compute metrics separately."""
+            loss, _, _ = self.compute_grpo_loss(
+                self.model,
                 self.ref_model,
                 formatted_prompt,
                 responses,
                 advantages,
-                old_log_probs
+                old_log_probs,
             )
-            return loss, (policy_reward, kl_div)
+            return loss
 
         # 4. Compute loss and gradients
         try:
-            # Compute gradients (with optional compilation)
+            # Compute gradients (with optional compilation). No aux in this MLX.
             grad_fn_raw = nn.value_and_grad(self.model, loss_fn)
             loss_and_grad_fn = mx.compile(grad_fn_raw) if self.args.use_compile else grad_fn_raw
-            (loss, (policy_reward, kl_div)), grads = loss_and_grad_fn()
+            loss, grads = loss_and_grad_fn()
+
+            # Recompute metrics for logging (no grad needed here)
+            policy_reward, kl_div = mx.array(0.0), mx.array(0.0)
+            try:
+                _, policy_reward, kl_div = self.compute_grpo_loss(
+                    self.model,
+                    self.ref_model,
+                    formatted_prompt,
+                    responses,
+                    advantages,
+                    old_log_probs,
+                )
+            except Exception:
+                pass
 
             # Accumulate grads
             if self._accum_grads is None:
