@@ -1,7 +1,8 @@
 # Quick smoke test configuration with reduced parameters
 # Use this for fast iteration and testing
 
-model_name = "Qwen/Qwen2.5-1.5B-Instruct"
+# Use your converted model (change path if you moved it)
+model_name = "utils/mlx_model"
 output_dir = "outputs/smoke-test"
 run_name   = "smoke-test-run"
 
