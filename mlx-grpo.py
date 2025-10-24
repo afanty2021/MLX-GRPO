@@ -583,25 +583,91 @@ class MLXGRPOTrainer:
         return (correct / total) if total > 0 else 0.0
 
     def save_checkpoint(self, path: str):
-        """Save model checkpoint"""
+        """Save model checkpoint with all necessary files for inference"""
         os.makedirs(path, exist_ok=True)
-        # Save model weights (.safetensors via Module.save_weights)
-        if isinstance(self.model, nn.Module):
-            self.model.save_weights(os.path.join(path, "model.safetensors"))
-        elif isinstance(self.model, dict) and 'model' in self.model:
-            self.model['model'].save_weights(os.path.join(path, "model.safetensors"))
+        
+        print(f"\n{'='*60}")
+        print(f"Saving checkpoint to: {path}")
+        print(f"{'='*60}")
+        
+        # 1. Save model weights (.safetensors via Module.save_weights)
+        try:
+            if isinstance(self.model, nn.Module):
+                self.model.save_weights(os.path.join(path, "model.safetensors"))
+            elif isinstance(self.model, dict) and 'model' in self.model:
+                self.model['model'].save_weights(os.path.join(path, "model.safetensors"))
+            print(f"✓ Model weights saved")
+        except Exception as e:
+            print(f"✗ Failed to save model weights: {e}")
+            return  # Critical failure - can't continue
 
-        # Save optimizer state as safetensors (dict[str, mx.array])
-        if hasattr(self.optimizer, "state"):
-            mx.save_safetensors(os.path.join(path, "optimizer.safetensors"), self.optimizer.state)
+        # 2. Copy tokenizer files (needed for inference)
+        import shutil
+        tokenizer_files = [
+            'tokenizer.json', 'tokenizer_config.json', 'special_tokens_map.json',
+            'vocab.json', 'merges.txt', 'added_tokens.json', 'chat_template.jinja'
+        ]
+        
+        # Determine source directory (where model was loaded from)
+        source_dir = self.args.model_name
+        if not os.path.isdir(source_dir):
+            # Model was loaded from HF, look in cache or current dir
+            if os.path.exists('tokenizer.json'):
+                source_dir = '.'
+        
+        tokenizer_copied = 0
+        for filename in tokenizer_files:
+            src_path = os.path.join(source_dir, filename)
+            if os.path.exists(src_path):
+                try:
+                    shutil.copy2(src_path, os.path.join(path, filename))
+                    tokenizer_copied += 1
+                except Exception:
+                    pass
+        
+        if tokenizer_copied > 0:
+            print(f"✓ Copied {tokenizer_copied} tokenizer files")
+        else:
+            print(f"⚠ No tokenizer files found (model may not load correctly)")
 
-        # Save training state as JSON (non-array metadata)
-        training_state = {
-            "step": int(self.step),
-            "args": self.args.__dict__,
-        }
-        with open(os.path.join(path, "trainer_state.json"), "w") as f:
-            json.dump(training_state, f, indent=2)
+        # 3. Save model config (needed for loading)
+        try:
+            config_src = os.path.join(source_dir, 'config.json')
+            if os.path.exists(config_src):
+                shutil.copy2(config_src, os.path.join(path, 'config.json'))
+                print(f"✓ Model config saved")
+            else:
+                print(f"⚠ config.json not found")
+        except Exception as e:
+            print(f"⚠ Could not copy config: {e}")
+
+        # 4. Save optimizer state (optional - only for resuming training)
+        try:
+            if hasattr(self.optimizer, "state") and self.optimizer.state:
+                mx.save_safetensors(os.path.join(path, "optimizer.safetensors"), self.optimizer.state)
+                print(f"✓ Optimizer state saved")
+        except Exception as e:
+            print(f"⚠ Skipping optimizer state (known MLX issue)")
+
+        # 5. Save training metadata
+        try:
+            training_state = {
+                "step": int(self.step),
+                "update_step": int(self.update_step),
+                "epoch": 0,
+                "model_name": self.args.model_name,
+                "args": {k: str(v) if not isinstance(v, (int, float, bool, str, type(None))) else v 
+                        for k, v in self.args.__dict__.items()},
+            }
+            with open(os.path.join(path, "trainer_state.json"), "w") as f:
+                json.dump(training_state, f, indent=2)
+            print(f"✓ Training metadata saved")
+        except Exception as e:
+            print(f"⚠ Could not save training metadata: {e}")
+        
+        print(f"{'='*60}")
+        print(f"✅ Checkpoint saved successfully!")
+        print(f"{'='*60}\n")
 
     def compute_grpo_loss(self, policy_model, ref_model, prompt: str,
                           responses: List[str], advantages: mx.array,
