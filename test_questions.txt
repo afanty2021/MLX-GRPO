@@ -1,0 +1,59 @@
+# MLX-GRPO Evaluation Questions
+# Test your fine-tuned model with these math word problems
+
+## ⭐ EASY (Basic arithmetic)
+
+1. Sarah has 12 apples and buys 8 more. How many apples does she have in total?
+   Answer: 20
+
+2. A pizza costs $15 and a drink costs $3. What is the total cost?
+   Answer: 18
+
+3. John ran 5 miles on Monday and 7 miles on Tuesday. How many miles did he run in total?
+   Answer: 12
+
+## ⭐⭐ MEDIUM (Multi-step reasoning)
+
+4. A store has 48 shirts. They sell half of them on Monday and 12 more on Tuesday. How many shirts are left?
+   Answer: 12
+
+5. Emily earns $15 per hour and works 6 hours a day. If she works 5 days, how much does she earn in total?
+   Answer: 450
+
+6. A box contains 120 candies. If 3 friends share them equally, how many candies does each friend get?
+   Answer: 40
+
+## ⭐⭐⭐ HARD (Complex multi-step)
+
+7. A farmer has 30 chickens. Each chicken lays 2 eggs per day. If the farmer sells eggs for $3 per dozen, how much money does he make in one day?
+   Answer: 15
+
+8. Maria saves $50 per month. After 8 months, she spends $120 on a gift. How much money does she have left?
+   Answer: 280
+
+9. A train travels 60 miles per hour. If it travels for 3.5 hours, how many miles does it cover?
+   Answer: 210
+
+## ⭐⭐⭐⭐ VERY HARD (GSM8K-style)
+
+10. A baker makes 144 cookies and puts them in boxes of 12. He sells each box for $8. If he keeps 3 boxes for himself, how much money does he make?
+    Answer: 72
+
+11. Tom has $500. He spends 40% on rent, $80 on food, and saves the rest. How much does he save?
+    Answer: 220
+
+12. A school has 450 students. 2/5 are boys. Of the boys, 60% play sports. How many boys play sports?
+    Answer: 108
+
+---
+
+## Expected Format:
+The fine-tuned model should respond with:
+
+<reasoning>
+[Step-by-step explanation]
+</reasoning>
+<answer>
+[Final numeric answer]
+</answer>
+
