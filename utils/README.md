@@ -1,9 +1,10 @@
 # MLX-GRPO Utilities
 
-Convert and use **any Hugging Face model** with the MLX-GRPO trainer.
+Convert and use **any Hugging Face model** with the MLX-GRPO trainer, including **Vision-Language Models**!
 
 ## ⚡ Quick Start
 
+### Text-Only Models
 ```bash
 # 1. Convert a model
 uv run python utils/convert_model.py --hf-path Qwen/Qwen2.5-1.5B-Instruct --quantize
@@ -15,21 +16,41 @@ uv run python utils/inference.py --model mlx_model --chat
 uv run mlx-grpo.py --config configs/smoke_test.toml --set model_name="mlx_model"
 ```
 
+### Vision-Language Models (NEW! 🎉)
+```bash
+# 1. Install mlx-vlm
+uv pip install mlx-vlm
+
+# 2. Convert a vision model (like DeepSeek-OCR!)
+uv run python utils/convert_vision_model.py --hf-path deepseek-ai/DeepSeek-OCR --quantize
+
+# 3. Test with images
+uv run python utils/inference_vision.py --model mlx_vision_model --image photo.jpg --prompt "Describe this image"
+```
+
 ## 📦 Installation
 
-All dependencies are managed via the project's `pyproject.toml`. The utilities use `mlx-lm` which is already included in the project dependencies.
+All dependencies are managed via the project's `pyproject.toml`. The utilities use `mlx-lm` for text models and `mlx-vlm` for vision models.
 
-To ensure you have all dependencies:
-
+### Text-Only Models
 ```bash
 # From the project root
 uv sync
+
+# Or if using pip:
+pip install mlx-lm>=0.28.3
 ```
 
-Or if using pip:
-
+### Vision-Language Models
 ```bash
-pip install mlx-lm>=0.28.3
+# Install mlx-vlm for vision support
+uv pip install mlx-vlm
+
+# Some models (like DeepSeek-OCR) need additional dependencies:
+uv pip install addict matplotlib torchvision einops
+
+# Or if using pip:
+pip install mlx-vlm addict matplotlib torchvision einops
 ```
 
 ## 🔄 Model Conversion
@@ -348,13 +369,156 @@ sudo sysctl iogpu.wired_limit_mb=N  # N > model size in MB
 # Increase wired memory limit if you see warnings
 ```
 
+## 🖼️ Vision-Language Models
+
+MLX now supports vision-language models through the `mlx-vlm` package! This enables models like DeepSeek-OCR, Qwen2-VL, LLaVA, and many more.
+
+### Installing Vision Support
+
+```bash
+# Using uv (recommended for this project)
+uv pip install mlx-vlm
+
+# Or using pip
+pip install mlx-vlm
+```
+
+### Converting Vision Models
+
+Use the `convert_vision_model.py` script to convert vision-language models:
+
+```bash
+# Convert DeepSeek-OCR (the model you wanted!)
+uv run python utils/convert_vision_model.py \
+    --hf-path deepseek-ai/DeepSeek-OCR \
+    --quantize \
+    --bits 4 \
+    --output-dir models/DeepSeek-OCR-mlx
+
+# Convert Qwen2-VL
+uv run python utils/convert_vision_model.py \
+    --hf-path Qwen/Qwen2-VL-2B-Instruct \
+    --quantize \
+    --output-dir models/qwen2-vl-mlx
+
+# Convert LLaVA
+uv run python utils/convert_vision_model.py \
+    --hf-path llava-hf/llava-1.5-7b-hf \
+    --quantize \
+    --bits 4 \
+    --output-dir models/llava-mlx
+```
+
+### Running Vision Model Inference
+
+Use the `inference_vision.py` script to test your converted vision models:
+
+```bash
+# Basic image understanding
+uv run python utils/inference_vision.py \
+    --model models/DeepSeek-OCR-mlx \
+    --image document.png \
+    --prompt "Extract all text from this image"
+
+# OCR with custom system prompt
+uv run python utils/inference_vision.py \
+    --model models/DeepSeek-OCR-mlx \
+    --image receipt.jpg \
+    --system "You are an OCR expert. Extract text accurately." \
+    --prompt "Read this receipt"
+
+# Interactive chat with images
+uv run python utils/inference_vision.py \
+    --model models/qwen2-vl-mlx \
+    --chat
+
+# Then in chat mode:
+# > image photo.jpg
+# > What do you see in this image?
+# > image another.jpg
+# > How is this different from the first image?
+
+# Multiple images at once
+uv run python utils/inference_vision.py \
+    --model models/llava-mlx \
+    --image img1.jpg \
+    --image img2.jpg \
+    --prompt "Compare these two images"
+```
+
+### Supported Vision Models
+
+The `mlx-vlm` package supports a wide range of vision-language models:
+
+#### OCR and Document Understanding
+- **DeepSeek-VL-V2 / DeepSeek-OCR** - Advanced OCR and document understanding
+- **Florence2** - Microsoft's OCR model
+- **Kimi-VL** - Document understanding
+
+#### General Vision-Language Models
+- **Qwen2-VL, Qwen2.5-VL, Qwen3-VL** - Excellent general-purpose VLMs
+- **LLaVA, LLaVA-Next, LLaVA-Bunny** - Popular open VLMs
+- **Pixtral** - Mistral's vision model
+- **Phi3-Vision** - Microsoft's compact VLM
+- **PaliGemma** - Google's VLM
+- **SmolVLM** - Compact vision model
+- **Idefics2, Idefics3** - HuggingFace's VLMs
+- **Molmo** - Allen AI's VLM
+- **InternVL-Chat** - Strong multilingual VLM
+- **Llama4** - Meta's vision-capable model (when released)
+
+#### Multi-Modal Models
+- **Gemma3, Gemma3n** - Google's multi-modal models with audio/video support
+- **Mistral3** - Mistral's multi-modal model
+
+### Vision Model Conversion Options
+
+The `convert_vision_model.py` script supports the same options as the text model converter:
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--hf-path` | Hugging Face model repo (required) | - |
+| `-q, --quantize` | Enable quantization | False |
+| `--bits` | Quantization bits (2, 4, or 8) | 4 |
+| `--group-size` | Quantization group size | 64 |
+| `--output-dir` | Output directory | `mlx_vision_model` |
+| `--upload-repo` | Upload to HF repo | None |
+| `--dtype` | Weight dtype (float16/bfloat16/float32) | float16 |
+| `--verbose` | Print detailed progress | False |
+
+### Vision Model Inference Options
+
+The `inference_vision.py` script provides these options:
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--model` | Path to MLX vision model | `mlx_vision_model` |
+| `--image` | Image file or URL (repeatable) | - |
+| `--prompt` | Text prompt | - |
+| `--system` | System prompt | None |
+| `--chat` | Interactive chat mode | False |
+| `--max-tokens` | Max tokens to generate | 512 |
+| `--temperature` | Sampling temperature | 0.7 |
+| `--verbose` | Print statistics | False |
+
+### Finding Pre-Converted Vision Models
+
+Browse the [MLX Community](https://huggingface.co/mlx-community) for pre-converted vision models. Look for models with "VL", "Vision", "OCR", or "LLaVA" in their names.
+
+Examples:
+- `mlx-community/Qwen2-VL-2B-Instruct-4bit`
+- `mlx-community/llava-1.5-7b-4bit`
+- Pre-converted DeepSeek-OCR models may be available
+
 ## 📚 Additional Resources
 
 - [MLX Documentation](https://ml-explore.github.io/mlx/)
-- [MLX-LM GitHub](https://github.com/ml-explore/mlx-lm)
+- [MLX-LM GitHub](https://github.com/ml-explore/mlx-lm) - Text-only models
+- [MLX-VLM GitHub](https://github.com/Blaizzy/mlx-vlm) - Vision-language models
 - [MLX Community on Hugging Face](https://huggingface.co/mlx-community)
 - [GRPO Paper](https://arxiv.org/abs/2402.03300)
 - [DeepSeekMath Paper](https://arxiv.org/abs/2402.03300)
+- [DeepSeek-OCR Model](https://huggingface.co/deepseek-ai/DeepSeek-OCR)
 
 ## 🤝 Contributing
 
