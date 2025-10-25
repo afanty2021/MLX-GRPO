@@ -138,6 +138,9 @@ temp/
 # ============================================================================
 # Project specific
 # ============================================================================
+# Experimental/failed attempts
+experimental/
+
 # Test files
 utils/.test_imports.py
 

@@ -15,6 +15,16 @@ import argparse
 import os
 from mlx_lm import convert
 
+# --- begin relaxed loader (no filtering; just non‑strict) --------------------
+def _enable_relaxed_loading():
+    import mlx.nn.layers.base as _base
+    _orig = _base.Module.load_weights
+    def _patched(self, weights, strict=True):
+        # Don't drop anything; just allow missing/extra silently
+        return _orig(self, weights, strict=False)
+    _base.Module.load_weights = _patched
+# --- end ---------------------------------------------------------------------
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -153,6 +163,20 @@ Examples:
     try:
         print("\nStarting conversion...")
         print("This may take several minutes depending on model size.\n")
+        
+        # Enable relaxed loading when converting GPT-2-style repacks
+        try:
+            from transformers import AutoConfig
+            if os.path.isdir(args.hf_path):
+                _cfg = AutoConfig.from_pretrained(args.hf_path)
+                if getattr(_cfg, "model_type", None) == "gpt2":
+                    print("[patch] GPT-2 relaxed loader enabled (non‑strict; keep biases)")
+                    _enable_relaxed_loading()
+        except Exception:
+            # If transformers isn't available or config can't be read, just try patch anyway
+            if os.path.isdir(args.hf_path):
+                print("[patch] Enabling GPT-2 relaxed loader (best-effort)")
+                _enable_relaxed_loading()
         
         # Convert the model
         convert(**convert_kwargs)
