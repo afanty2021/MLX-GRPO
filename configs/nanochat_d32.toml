@@ -34,6 +34,7 @@ log_jsonl = true
 # System
 seed = 42
 use_compile = false
+quantize_for_rollouts = false    # Disable for d32 - too sensitive to quantization!
 
 # Notes:
 # - This is a 32-layer, 2048-hidden model (vs 20-layer, 1280-hidden)

@@ -347,6 +347,7 @@ class MLXGRPOConfig:
     eval_samples: int = 200  # Number of samples to use for evaluation
     seed: int = 0
     use_compile: bool = True  # Toggle mx.compile for gradient computation
+    quantize_for_rollouts: bool = True  # Quantize model_old/ref_model to 4-bit (disable for large models)
     # --- evaluation & logging ---
     eval_every_updates: int = 25       # set 0 to disable periodic eval
     eval_subset_size: int = 200
@@ -414,13 +415,18 @@ class MLXGRPOTrainer:
         # 3. ref_model - original pretrained model (π_ref), never updated
         self.model_old = copy.deepcopy(model)  # πθ_old
         self.ref_model = copy.deepcopy(model)  # π_ref
-        try:
-            # Safe: these models are not trained
-            nn.quantize(self.model_old, group_size=64, bits=4)
-            nn.quantize(self.ref_model, group_size=64, bits=4)
-            print("Quantized model_old and ref_model to 4-bit for faster rollouts.")
-        except Exception as e:
-            print(f"Quantization skipped: {e}")
+        
+        # Optionally quantize for faster rollouts (can cause instability in large models)
+        if args.quantize_for_rollouts:
+            try:
+                # Safe: these models are not trained
+                nn.quantize(self.model_old, group_size=64, bits=4)
+                nn.quantize(self.ref_model, group_size=64, bits=4)
+                print("Quantized model_old and ref_model to 4-bit for faster rollouts.")
+            except Exception as e:
+                print(f"Quantization skipped: {e}")
+        else:
+            print("Quantization disabled (quantize_for_rollouts=False). Using full precision for rollouts.")
 
         # Steps / updates accounting
         self.step = 0                                    # batch steps (for logs)
