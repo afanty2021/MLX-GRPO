@@ -1,0 +1,45 @@
+# Karpathy's nanochat-d32 GRPO Training Configuration
+# Larger, better-trained model (32 layers, 2048 hidden)
+
+model_name = "models/nanochat-d32-mlx"
+output_dir = "outputs/nanochat-d32-grpo"
+run_name   = "nanochat-d32-v1"
+
+# Training parameters - conservative for larger model
+learning_rate = 3e-6              # Lower LR for larger model
+num_epochs = 2
+batch_size = 1
+gradient_accumulation_steps = 4   # Effective batch size of 4
+max_train_samples = 500           # Train on 500 examples
+warmup_ratio = 0.05
+max_grad_norm = 1.0
+logging_steps = 1
+
+# GRPO sampling
+num_generations = 4               # Generate 4 responses per prompt
+max_new_tokens = 128              # Longer for better reasoning
+temperature = 0.8                 # Balanced exploration
+clip_eps = 0.2                    # PPO-style clipping
+kl_coeff = 0.02                   # Moderate KL penalty
+
+# Evaluation
+eval_steps = 25
+eval_samples = 20
+eval_every_updates = 25
+eval_subset_size = 20
+eval_max_new_tokens = 128
+save_steps = 50
+log_jsonl = true
+
+# System
+seed = 42
+use_compile = false
+
+# Notes:
+# - This is a 32-layer, 2048-hidden model (vs 20-layer, 1280-hidden)
+# - Already performs well at step 650:
+#   * Coherent sentences
+#   * Correct arithmetic (5*6=30)
+#   * Factual knowledge (Paris, Jupiter)
+# - Should train much better than smaller model!
+
