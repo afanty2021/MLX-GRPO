@@ -4,6 +4,7 @@ from mlx.utils import tree_flatten, tree_map
 from datasets import load_dataset, Dataset
 from mlx_lm import load as mlx_load, generate as mlx_generate
 from mlx_lm.sample_utils import make_sampler, make_logits_processors
+from mlx_lm.utils import load_model as mlx_load_model_only
 import os
 import json
 from dataclasses import dataclass, asdict
@@ -16,6 +17,8 @@ import inspect
 import random
 import argparse
 import tomllib  # Python 3.11+
+import pickle
+from pathlib import Path
 
 # -------------------------------------------------------------------
 # Dataset Preparation and Formatting
@@ -128,9 +131,127 @@ def xmlcount_reward_func(completions, **kwargs) -> list[float]:
 # For training with LoRA, you can use: python -m mlx_lm.lora --model <model> --train
 # This implementation focuses on full model fine-tuning with GRPO
 
+class TiktokenTokenizerWrapper:
+    """Wrapper to make tiktoken.Encoding compatible with GRPO expectations"""
+    
+    def __init__(self, tiktoken_tokenizer):
+        self.tiktoken = tiktoken_tokenizer
+        # Set up special tokens
+        self.eos_token = "<|endoftext|>"
+        self.pad_token = "<|endoftext|>"
+        self.bos_token = "<|endoftext|>"
+        
+        # Get token IDs (tiktoken may not have these as properties)
+        try:
+            self.eos_token_id = tiktoken_tokenizer.eot_token
+        except (AttributeError, KeyError):
+            # If no eot_token, try encoding the token
+            self.eos_token_id = tiktoken_tokenizer.encode(self.eos_token, allowed_special="all")[0]
+        
+        self.pad_token_id = self.eos_token_id
+        self.bos_token_id = self.eos_token_id
+        
+        # Add properties needed by mlx_lm
+        self.vocab_size = tiktoken_tokenizer.n_vocab
+        self.all_special_tokens = [self.eos_token, self.pad_token, self.bos_token]
+        self.all_special_ids = [self.eos_token_id, self.pad_token_id, self.bos_token_id]
+        self.chat_template = None  # Nanochat doesn't have a specific chat template
+        self.clean_up_tokenization_spaces = True  # Standard tokenizer behavior
+        
+    def encode(self, text, add_special_tokens=False):
+        """Encode text to token IDs"""
+        tokens = self.tiktoken.encode(text, allowed_special="all")
+        if add_special_tokens:
+            tokens = [self.bos_token_id] + tokens
+        return tokens
+    
+    def decode(self, token_ids, skip_special_tokens=False):
+        """Decode token IDs to text"""
+        if isinstance(token_ids, list):
+            return self.tiktoken.decode(token_ids)
+        else:
+            # Handle single token
+            return self.tiktoken.decode([token_ids])
+    
+    def apply_chat_template(self, messages, add_generation_prompt=True, tokenize=False):
+        """Apply chat template - simple version for nanochat"""
+        # For nanochat, just concatenate messages with simple formatting
+        formatted = ""
+        for msg in messages:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+            
+            if role == "system":
+                formatted += f"{content}\n\n"
+            elif role == "user":
+                formatted += f"User: {content}\n"
+            elif role == "assistant":
+                formatted += f"Assistant: {content}\n"
+        
+        if add_generation_prompt:
+            formatted += "Assistant: "
+        
+        if tokenize:
+            return self.encode(formatted)
+        return formatted
+    
+    def get_vocab(self):
+        """Return vocab dictionary - minimal implementation for compatibility"""
+        # For tiktoken, we don't have easy access to the full vocab
+        # Return a minimal dict with special tokens that code might check for
+        return {
+            self.eos_token: self.eos_token_id,
+            self.pad_token: self.pad_token_id,
+            self.bos_token: self.bos_token_id,
+        }
+
+def load_tiktoken_tokenizer(model_path):
+    """Load tiktoken tokenizer from pickle file"""
+    model_path = Path(model_path)
+    tokenizer_pkl = model_path / "tokenizer.pkl"
+    
+    if not tokenizer_pkl.exists():
+        return None
+    
+    try:
+        with open(tokenizer_pkl, "rb") as f:
+            tiktoken_tokenizer = pickle.load(f)
+        
+        print(f"✅ Loaded tiktoken tokenizer (vocab size: {tiktoken_tokenizer.n_vocab})")
+        return TiktokenTokenizerWrapper(tiktoken_tokenizer)
+    except Exception as e:
+        print(f"⚠️  Failed to load tiktoken tokenizer: {e}")
+        return None
+
 def load_model(model_name):
-    """Load model and tokenizer using MLX-LM"""
-    # Allow remote code/tokenizer templates when needed (e.g., Qwen chat)
+    """Load model and tokenizer using MLX-LM, with custom tiktoken support"""
+    
+    # First, try to load tiktoken tokenizer if available
+    tiktoken_tok = load_tiktoken_tokenizer(model_name)
+    
+    if tiktoken_tok is not None:
+        # Load model without tokenizer  
+        print(f"Loading model from {model_name}...")
+        from mlx_lm.utils import load_config
+        
+        # Load config and model manually
+        model_path = Path(model_name)
+        config = load_config(model_path)
+        
+        # Import the appropriate model class
+        from mlx_lm.models import nanochat
+        model_args = nanochat.ModelArgs(**{k:v for k,v in config.items() if k in ['hidden_size', 'num_hidden_layers', 'num_attention_heads', 'num_key_value_heads', 'vocab_size', 'max_position_embeddings', 'intermediate_size', 'rope_theta']})
+        model = nanochat.Model(model_args)
+        
+        # Load weights
+        weights = mx.load(str(model_path / "model.safetensors"))
+        model.load_weights(list(weights.items()), strict=False)
+        
+        print(f"✅ Model loaded with tiktoken tokenizer!")
+        return model, tiktoken_tok
+    
+    # Fall back to standard mlx_load
+    print(f"Loading model with standard tokenizer...")
     model, tokenizer = mlx_load(model_name, tokenizer_config={"trust_remote_code": True})
 
     # Ensure pad token is set
