@@ -1,0 +1,38 @@
+# Nanochat GRPO Test Configuration
+# Ultra-light test with our converted nanochat model
+
+model_name = "models/nanochat-mlx"    # Our converted nanochat model
+output_dir = "outputs/nanochat-grpo-test"
+run_name   = "nanochat-grpo-test"
+
+# training (absolute minimum for testing)
+learning_rate = 1e-5
+num_epochs = 1
+batch_size = 1
+gradient_accumulation_steps = 1
+max_train_samples = 10             # Start with just 10 examples
+warmup_ratio = 0.1
+max_grad_norm = 0.1
+logging_steps = 1
+
+# sampling / rollout (MINIMAL)
+num_generations = 2                # Just 2 samples per prompt
+max_new_tokens = 32                # Short generations
+temperature = 0.7
+clip_eps = 0.2
+kl_coeff = 0.0
+
+# eval & logging
+eval_steps = 5
+eval_samples = 5                   # Minimal eval
+eval_every_updates = 5
+eval_subset_size = 5
+eval_max_new_tokens = 32
+save_steps = 10
+log_jsonl = true
+
+# system
+seed = 42
+use_compile = false                # Disable for debugging
+
+

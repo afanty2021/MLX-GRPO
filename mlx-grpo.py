@@ -4,9 +4,10 @@ from mlx.utils import tree_flatten, tree_map
 from datasets import load_dataset, Dataset
 from mlx_lm import load as mlx_load, generate as mlx_generate
 from mlx_lm.sample_utils import make_sampler, make_logits_processors
+from mlx_lm.utils import load_model as mlx_load_model_only
 import os
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from typing import List, Optional, Dict, Any, Tuple
 import math
 from mlx.optimizers import Adam, cosine_decay, clip_grad_norm
@@ -14,6 +15,10 @@ import re
 import copy
 import inspect
 import random
+import argparse
+import tomllib  # Python 3.11+
+import pickle
+from pathlib import Path
 
 # -------------------------------------------------------------------
 # Dataset Preparation and Formatting
@@ -122,18 +127,131 @@ def xmlcount_reward_func(completions, **kwargs) -> list[float]:
 # -------------------------------------------------------------------
 # Model Configuration and Loading (Pure MLX)
 # -------------------------------------------------------------------
-# Use a model name (here using Qwen as an example)
-model_name = "Qwen/Qwen2.5-1.5B-Instruct"
-output_dir = "outputs/Qwen-1.5B-MLX-GRPO"
-run_name = "Qwen-1.5B-MLX-GRPO-gsm8k"
-
 # Note: MLX-LM has built-in LoRA support via command-line tools
 # For training with LoRA, you can use: python -m mlx_lm.lora --model <model> --train
 # This implementation focuses on full model fine-tuning with GRPO
 
+class TiktokenTokenizerWrapper:
+    """Wrapper to make tiktoken.Encoding compatible with GRPO expectations"""
+    
+    def __init__(self, tiktoken_tokenizer):
+        self.tiktoken = tiktoken_tokenizer
+        # Set up special tokens
+        self.eos_token = "<|endoftext|>"
+        self.pad_token = "<|endoftext|>"
+        self.bos_token = "<|endoftext|>"
+        
+        # Get token IDs (tiktoken may not have these as properties)
+        try:
+            self.eos_token_id = tiktoken_tokenizer.eot_token
+        except (AttributeError, KeyError):
+            # If no eot_token, try encoding the token
+            self.eos_token_id = tiktoken_tokenizer.encode(self.eos_token, allowed_special="all")[0]
+        
+        self.pad_token_id = self.eos_token_id
+        self.bos_token_id = self.eos_token_id
+        
+        # Add properties needed by mlx_lm
+        self.vocab_size = tiktoken_tokenizer.n_vocab
+        self.all_special_tokens = [self.eos_token, self.pad_token, self.bos_token]
+        self.all_special_ids = [self.eos_token_id, self.pad_token_id, self.bos_token_id]
+        self.chat_template = None  # Nanochat doesn't have a specific chat template
+        self.clean_up_tokenization_spaces = True  # Standard tokenizer behavior
+        
+    def encode(self, text, add_special_tokens=False):
+        """Encode text to token IDs"""
+        tokens = self.tiktoken.encode(text, allowed_special="all")
+        if add_special_tokens:
+            tokens = [self.bos_token_id] + tokens
+        return tokens
+    
+    def decode(self, token_ids, skip_special_tokens=False):
+        """Decode token IDs to text"""
+        if isinstance(token_ids, list):
+            return self.tiktoken.decode(token_ids)
+        else:
+            # Handle single token
+            return self.tiktoken.decode([token_ids])
+    
+    def apply_chat_template(self, messages, add_generation_prompt=True, tokenize=False):
+        """Apply chat template - simple version for nanochat"""
+        # For nanochat, just concatenate messages with simple formatting
+        formatted = ""
+        for msg in messages:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+            
+            if role == "system":
+                formatted += f"{content}\n\n"
+            elif role == "user":
+                formatted += f"User: {content}\n"
+            elif role == "assistant":
+                formatted += f"Assistant: {content}\n"
+        
+        if add_generation_prompt:
+            formatted += "Assistant: "
+        
+        if tokenize:
+            return self.encode(formatted)
+        return formatted
+    
+    def get_vocab(self):
+        """Return vocab dictionary - minimal implementation for compatibility"""
+        # For tiktoken, we don't have easy access to the full vocab
+        # Return a minimal dict with special tokens that code might check for
+        return {
+            self.eos_token: self.eos_token_id,
+            self.pad_token: self.pad_token_id,
+            self.bos_token: self.bos_token_id,
+        }
+
+def load_tiktoken_tokenizer(model_path):
+    """Load tiktoken tokenizer from pickle file"""
+    model_path = Path(model_path)
+    tokenizer_pkl = model_path / "tokenizer.pkl"
+    
+    if not tokenizer_pkl.exists():
+        return None
+    
+    try:
+        with open(tokenizer_pkl, "rb") as f:
+            tiktoken_tokenizer = pickle.load(f)
+        
+        print(f"✅ Loaded tiktoken tokenizer (vocab size: {tiktoken_tokenizer.n_vocab})")
+        return TiktokenTokenizerWrapper(tiktoken_tokenizer)
+    except Exception as e:
+        print(f"⚠️  Failed to load tiktoken tokenizer: {e}")
+        return None
+
 def load_model(model_name):
-    """Load model and tokenizer using MLX-LM"""
-    # Allow remote code/tokenizer templates when needed (e.g., Qwen chat)
+    """Load model and tokenizer using MLX-LM, with custom tiktoken support"""
+    
+    # First, try to load tiktoken tokenizer if available
+    tiktoken_tok = load_tiktoken_tokenizer(model_name)
+    
+    if tiktoken_tok is not None:
+        # Load model without tokenizer  
+        print(f"Loading model from {model_name}...")
+        from mlx_lm.utils import load_config
+        
+        # Load config and model manually
+        model_path = Path(model_name)
+        config = load_config(model_path)
+        
+        # Import the appropriate model class
+        from mlx_lm.models import nanochat
+        model_args = nanochat.ModelArgs(**{k:v for k,v in config.items() if k in ['hidden_size', 'num_hidden_layers', 'num_attention_heads', 'num_key_value_heads', 'vocab_size', 'max_position_embeddings', 'intermediate_size', 'rope_theta']})
+        model = nanochat.Model(model_args)
+        
+        # Load weights
+        weights = mx.load(str(model_path / "model.safetensors"))
+        model.load_weights(list(weights.items()), strict=False)
+        
+        print(f"✅ Model loaded with tiktoken tokenizer!")
+        return model, tiktoken_tok
+    
+    # Fall back to standard mlx_load
+    print(f"Loading model with standard tokenizer...")
     model, tokenizer = mlx_load(model_name, tokenizer_config={"trust_remote_code": True})
 
     # Ensure pad token is set
@@ -142,16 +260,6 @@ def load_model(model_name):
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
     return model, tokenizer
-
-def get_model_params(model):
-    """Extract trainable parameters from MLX model"""
-    # MLX-LM models are typically nn.Module instances or dicts
-    if isinstance(model, nn.Module):
-        return model.trainable_parameters()
-    elif isinstance(model, dict) and 'model' in model:
-        return model['model'].trainable_parameters()
-    else:
-        raise ValueError(f"Unexpected model type: {type(model)}")
 
 def calculate_log_probs_single(model, tokenizer, prompt: str, completion: str) -> mx.array:
     """Return ``log p(o_i | q)`` for a single completion.
@@ -211,12 +319,15 @@ def calculate_log_probs_single(model, tokenizer, prompt: str, completion: str) -
 @dataclass
 class MLXGRPOConfig:
     """Configuration class for MLX GRPO training"""
-    output_dir: str
-    run_name: str
+    # Core run metadata
+    model_name: str = "Qwen/Qwen2.5-1.5B-Instruct"
+    output_dir: str = "outputs/Qwen-1.5B-MLX-GRPO"
+    run_name: str = "Qwen-1.5B-MLX-GRPO-gsm8k"
     learning_rate: float = 1e-6
     batch_size: int = 1
     gradient_accumulation_steps: int = 4
     num_epochs: int = 1
+    max_train_samples: int = 0  # Limit training samples (0 = use all)
     warmup_ratio: float = 0.1
     max_grad_norm: float = 0.1
     logging_steps: int = 1
@@ -236,11 +347,58 @@ class MLXGRPOConfig:
     eval_samples: int = 200  # Number of samples to use for evaluation
     seed: int = 0
     use_compile: bool = True  # Toggle mx.compile for gradient computation
+    quantize_for_rollouts: bool = True  # Quantize model_old/ref_model to 4-bit (disable for large models)
     # --- evaluation & logging ---
     eval_every_updates: int = 25       # set 0 to disable periodic eval
     eval_subset_size: int = 200
     eval_max_new_tokens: int = 128
     log_jsonl: bool = True
+
+# -------------------------
+# Config helpers
+# -------------------------
+def _coerce_value(val: str, target):
+    """Best-effort string -> target type coercion."""
+    t = target
+    if t is bool:
+        return val.lower() in {"1", "true", "yes", "on"}
+    if t is int:
+        return int(val)
+    if t is float:
+        return float(val)
+    return val  # str or anything else: leave as-is
+
+def load_toml_config(path: str) -> Dict[str, Any]:
+    with open(path, "rb") as f:
+        return tomllib.load(f)
+
+def update_config_from_dict(cfg: MLXGRPOConfig, d: Dict[str, Any]) -> MLXGRPOConfig:
+    for k, v in d.items():
+        if hasattr(cfg, k):
+            setattr(cfg, k, v)
+    return cfg
+
+def apply_overrides(cfg: MLXGRPOConfig, overrides: list[str]) -> MLXGRPOConfig:
+    """Override fields with --set key=value (repeatable)."""
+    hints = MLXGRPOConfig.__annotations__
+    for item in overrides:
+        if "=" not in item:
+            print(f"[warn] ignoring override (no '='): {item}")
+            continue
+        key, val = item.split("=", 1)
+        key = key.strip()
+        val = val.strip()
+        if not hasattr(cfg, key):
+            print(f"[warn] unknown config key: {key}")
+            continue
+        target_type = hints.get(key, str)
+        try:
+            coerced = _coerce_value(val, target_type)
+        except Exception:
+            print(f"[warn] failed to coerce '{val}' to {target_type}; using string")
+            coerced = val
+        setattr(cfg, key, coerced)
+    return cfg
 
 class MLXGRPOTrainer:
     def __init__(self, model, tokenizer, reward_funcs, args: MLXGRPOConfig, train_dataset, eval_dataset=None):
@@ -257,13 +415,18 @@ class MLXGRPOTrainer:
         # 3. ref_model - original pretrained model (π_ref), never updated
         self.model_old = copy.deepcopy(model)  # πθ_old
         self.ref_model = copy.deepcopy(model)  # π_ref
-        try:
-            # Safe: these models are not trained
-            nn.quantize(self.model_old, group_size=64, bits=4)
-            nn.quantize(self.ref_model, group_size=64, bits=4)
-            print("Quantized model_old and ref_model to 4-bit for faster rollouts.")
-        except Exception as e:
-            print(f"Quantization skipped: {e}")
+        
+        # Optionally quantize for faster rollouts (can cause instability in large models)
+        if args.quantize_for_rollouts:
+            try:
+                # Safe: these models are not trained
+                nn.quantize(self.model_old, group_size=64, bits=4)
+                nn.quantize(self.ref_model, group_size=64, bits=4)
+                print("Quantized model_old and ref_model to 4-bit for faster rollouts.")
+            except Exception as e:
+                print(f"Quantization skipped: {e}")
+        else:
+            print("Quantization disabled (quantize_for_rollouts=False). Using full precision for rollouts.")
 
         # Steps / updates accounting
         self.step = 0                                    # batch steps (for logs)
@@ -341,6 +504,9 @@ class MLXGRPOTrainer:
         """
         messages = batch['prompt']
         formatted_prompt = self.format_prompt(messages)
+        
+        # Nudge the model to follow the required format
+        formatted_prompt = formatted_prompt + "<reasoning>"
 
         responses: List[str] = []
         old_log_probs: List[mx.array] = []
@@ -544,25 +710,91 @@ class MLXGRPOTrainer:
         return (correct / total) if total > 0 else 0.0
 
     def save_checkpoint(self, path: str):
-        """Save model checkpoint"""
+        """Save model checkpoint with all necessary files for inference"""
         os.makedirs(path, exist_ok=True)
-        # Save model weights (.safetensors via Module.save_weights)
-        if isinstance(self.model, nn.Module):
-            self.model.save_weights(os.path.join(path, "model.safetensors"))
-        elif isinstance(self.model, dict) and 'model' in self.model:
-            self.model['model'].save_weights(os.path.join(path, "model.safetensors"))
+        
+        print(f"\n{'='*60}")
+        print(f"Saving checkpoint to: {path}")
+        print(f"{'='*60}")
+        
+        # 1. Save model weights (.safetensors via Module.save_weights)
+        try:
+            if isinstance(self.model, nn.Module):
+                self.model.save_weights(os.path.join(path, "model.safetensors"))
+            elif isinstance(self.model, dict) and 'model' in self.model:
+                self.model['model'].save_weights(os.path.join(path, "model.safetensors"))
+            print(f"✓ Model weights saved")
+        except Exception as e:
+            print(f"✗ Failed to save model weights: {e}")
+            return  # Critical failure - can't continue
 
-        # Save optimizer state as safetensors (dict[str, mx.array])
-        if hasattr(self.optimizer, "state"):
-            mx.save_safetensors(os.path.join(path, "optimizer.safetensors"), self.optimizer.state)
+        # 2. Copy tokenizer files (needed for inference)
+        import shutil
+        tokenizer_files = [
+            'tokenizer.json', 'tokenizer_config.json', 'special_tokens_map.json',
+            'vocab.json', 'merges.txt', 'added_tokens.json', 'chat_template.jinja'
+        ]
+        
+        # Determine source directory (where model was loaded from)
+        source_dir = self.args.model_name
+        if not os.path.isdir(source_dir):
+            # Model was loaded from HF, look in cache or current dir
+            if os.path.exists('tokenizer.json'):
+                source_dir = '.'
+        
+        tokenizer_copied = 0
+        for filename in tokenizer_files:
+            src_path = os.path.join(source_dir, filename)
+            if os.path.exists(src_path):
+                try:
+                    shutil.copy2(src_path, os.path.join(path, filename))
+                    tokenizer_copied += 1
+                except Exception:
+                    pass
+        
+        if tokenizer_copied > 0:
+            print(f"✓ Copied {tokenizer_copied} tokenizer files")
+        else:
+            print(f"⚠ No tokenizer files found (model may not load correctly)")
 
-        # Save training state as JSON (non-array metadata)
-        training_state = {
-            "step": int(self.step),
-            "args": self.args.__dict__,
-        }
-        with open(os.path.join(path, "trainer_state.json"), "w") as f:
-            json.dump(training_state, f, indent=2)
+        # 3. Save model config (needed for loading)
+        try:
+            config_src = os.path.join(source_dir, 'config.json')
+            if os.path.exists(config_src):
+                shutil.copy2(config_src, os.path.join(path, 'config.json'))
+                print(f"✓ Model config saved")
+            else:
+                print(f"⚠ config.json not found")
+        except Exception as e:
+            print(f"⚠ Could not copy config: {e}")
+
+        # 4. Save optimizer state (optional - only for resuming training)
+        try:
+            if hasattr(self.optimizer, "state") and self.optimizer.state:
+                mx.save_safetensors(os.path.join(path, "optimizer.safetensors"), self.optimizer.state)
+                print(f"✓ Optimizer state saved")
+        except Exception as e:
+            print(f"⚠ Skipping optimizer state (known MLX issue)")
+
+        # 5. Save training metadata
+        try:
+            training_state = {
+                "step": int(self.step),
+                "update_step": int(self.update_step),
+                "epoch": 0,
+                "model_name": self.args.model_name,
+                "args": {k: str(v) if not isinstance(v, (int, float, bool, str, type(None))) else v 
+                        for k, v in self.args.__dict__.items()},
+            }
+            with open(os.path.join(path, "trainer_state.json"), "w") as f:
+                json.dump(training_state, f, indent=2)
+            print(f"✓ Training metadata saved")
+        except Exception as e:
+            print(f"⚠ Could not save training metadata: {e}")
+        
+        print(f"{'='*60}")
+        print(f"✅ Checkpoint saved successfully!")
+        print(f"{'='*60}\n")
 
     def compute_grpo_loss(self, policy_model, ref_model, prompt: str,
                           responses: List[str], advantages: mx.array,
@@ -645,7 +877,7 @@ class MLXGRPOTrainer:
         total = 0
 
         # Sampler & processors for evaluation (greedy, temp=0)
-        sampler = make_sampler(temperature=0.0, top_p=1.0, min_p=0.0, min_tokens_to_keep=1)
+        sampler = make_sampler(0.0, top_p=1.0, min_p=0.0, min_tokens_to_keep=1)
         logits_processors = make_logits_processors(
             None, repetition_penalty=None, repetition_context_size=None
         )
@@ -740,24 +972,38 @@ class MLXGRPOTrainer:
             print(f"---")
 
         # 3. Define loss function for gradient computation
-        def loss_fn(policy_model):
-            """Loss function that computes GRPO objective."""
-            loss, policy_reward, kl_div = self.compute_grpo_loss(
-                policy_model,
+        def loss_fn():
+            """Return only the scalar loss; compute metrics separately."""
+            loss, _, _ = self.compute_grpo_loss(
+                self.model,
                 self.ref_model,
                 formatted_prompt,
                 responses,
                 advantages,
-                old_log_probs
+                old_log_probs,
             )
-            return loss, (policy_reward, kl_div)
+            return loss
 
         # 4. Compute loss and gradients
         try:
-            # Compute gradients (with optional compilation)
+            # Compute gradients (with optional compilation). No aux in this MLX.
             grad_fn_raw = nn.value_and_grad(self.model, loss_fn)
             loss_and_grad_fn = mx.compile(grad_fn_raw) if self.args.use_compile else grad_fn_raw
-            (loss, (policy_reward, kl_div)), grads = loss_and_grad_fn()
+            loss, grads = loss_and_grad_fn()
+
+            # Recompute metrics for logging (no grad needed here)
+            policy_reward, kl_div = mx.array(0.0), mx.array(0.0)
+            try:
+                _, policy_reward, kl_div = self.compute_grpo_loss(
+                    self.model,
+                    self.ref_model,
+                    formatted_prompt,
+                    responses,
+                    advantages,
+                    old_log_probs,
+                )
+            except Exception:
+                pass
 
             # Accumulate grads
             if self._accum_grads is None:
@@ -849,6 +1095,11 @@ class MLXGRPOTrainer:
         for epoch in range(self.args.num_epochs):
             indices = list(range(len(self.train_dataset)))
             random.shuffle(indices)
+            
+            # Limit training samples if specified
+            if self.args.max_train_samples > 0:
+                indices = indices[:self.args.max_train_samples]
+                print(f"[INFO] Limiting training to {len(indices)} samples (max_train_samples={self.args.max_train_samples})")
 
             for idx in indices:
                 batch = self.train_dataset[idx]
@@ -891,37 +1142,55 @@ class MLXGRPOTrainer:
 
 def main():
     """Main training function"""
-    print("="*80)
-    print("MLX-GRPO Training Pipeline")
-    print("="*80)
-    print(f"Model: {model_name}")
-    print(f"Output Dir: {output_dir}")
-    print(f"Dataset: GSM8K (train split)")
-    print("="*80)
-
-    # Initialize configuration with DeepSeek-inspired parameters
-    config = MLXGRPOConfig(
-        output_dir=output_dir,
-        run_name=run_name,
-        learning_rate=1e-6,  # DeepSeek uses 1e-6
-        num_generations=64,  # DeepSeek uses 64 samples per prompt
-        max_prompt_length=512,
-        max_completion_length=1024,  # DeepSeek uses 1024
-        max_new_tokens=512,
-        temperature=0.7,
-        clip_eps=0.2,
-        kl_coeff=0.0,  # Can set to 0.04 if needed
-        num_epochs=1,
-        batch_size=1,
-        gradient_accumulation_steps=4,
-        save_steps=100,
-        logging_steps=1,
-        seed=0
+    # ---------------- CLI / Config ----------------
+    parser = argparse.ArgumentParser(description="MLX-GRPO trainer")
+    parser.add_argument(
+        "--config",
+        default=os.environ.get("MLX_GRPO_CONFIG", "configs/test.toml"),
+        help="Path to a TOML config (default: configs/test.toml or $MLX_GRPO_CONFIG).",
     )
+    parser.add_argument(
+        "--set",
+        action="append",
+        default=[],
+        help="Override config keys as --set key=value (repeatable).",
+    )
+    args = parser.parse_args()
+
+    # Start with defaults, then load TOML if it exists, then apply overrides
+    config = MLXGRPOConfig()
+    if os.path.exists(args.config):
+        print(f"[config] loading {args.config}")
+        toml_cfg = load_toml_config(args.config)
+        # support either flat keys or a [mlx_grpo] table
+        flat = toml_cfg.get("mlx_grpo", toml_cfg)
+        config = update_config_from_dict(config, flat)
+    else:
+        print(f"[config] file not found, using defaults: {args.config}")
+    if args.set:
+        print(f"[config] applying overrides: {args.set}")
+        config = apply_overrides(config, args.set)
 
     # Seed for reproducibility
     mx.random.seed(config.seed)
     random.seed(config.seed)
+
+    # Resolve per-run output directory early to avoid clobbering
+    run_dir = os.path.join(config.output_dir, config.run_name)
+    os.makedirs(run_dir, exist_ok=True)
+    config.output_dir = run_dir
+
+    print("="*80)
+    print("MLX-GRPO Training Pipeline")
+    print("="*80)
+    print(f"Model: {config.model_name}")
+    print(f"Output Dir: {config.output_dir}")
+    print(f"Dataset: GSM8K (train split)")
+    print("="*80)
+
+    # Persist the resolved configuration for reproducibility
+    with open(os.path.join(config.output_dir, "config.resolved.json"), "w") as f:
+        json.dump(asdict(config), f, indent=2)
 
     print(f"\nTraining Configuration:")
     print(f"  Learning Rate: {config.learning_rate}")
@@ -941,7 +1210,7 @@ def main():
 
     # Load model and tokenizer
     print("\nLoading model and tokenizer...")
-    model, tokenizer = load_model(model_name)
+    model, tokenizer = load_model(config.model_name)
     print(f"Model loaded successfully")
     print(f"Model type: {type(model)}")
 
@@ -970,7 +1239,7 @@ def main():
 
     print("\n" + "="*80)
     print("Training Complete!")
-    print(f"Model saved to: {output_dir}")
+    print(f"Model saved to: {config.output_dir}")
     print("="*80)
 
 if __name__ == "__main__":

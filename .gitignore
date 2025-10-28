@@ -1,8 +1,33 @@
+# MLX-GRPO .gitignore
+
+# ============================================================================
+# Model Files (LARGE - never commit these!)
+# ============================================================================
+mlx_model/
+mlx_models/
+models/
+*.safetensors
+*.gguf
+*.bin
+*.pth
+*.pt
+
+# Training outputs
+outputs/
+checkpoints/
+checkpoint-*/
+*.jsonl
+
+# ============================================================================
 # Python
+# ============================================================================
+# Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
+
+# Distribution / packaging
 .Python
 build/
 develop-eggs/
@@ -22,22 +47,103 @@ wheels/
 
 # Virtual environments
 venv/
-ENV/
 env/
+ENV/
+.venv/
 
+# UV package manager
+.uv/
+uv.lock
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Unit test / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+
+# ============================================================================
+# Jupyter Notebook
+# ============================================================================
+.ipynb_checkpoints
+*.ipynb
+
+# ============================================================================
+# MLX / Machine Learning
+# ============================================================================
+# Hugging Face cache
+.cache/
+huggingface/
+
+# Weights & Biases
+wandb/
+
+# TensorBoard
+runs/
+logs/
+tensorboard/
+
+# Dataset caches
+*.arrow
+*.parquet
+
+# ============================================================================
+# macOS
+# ============================================================================
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# ============================================================================
 # IDEs
+# ============================================================================
+# VSCode
 .vscode/
+*.code-workspace
+
+# PyCharm
 .idea/
+*.iml
+
+# Cursor
+.cursor/
+
+# Vim
 *.swp
 *.swo
 *~
 
-# OS
-.DS_Store
-Thumbs.db
-
-# MLX-specific
-outputs/
-*.safetensors
-checkpoints/
+# ============================================================================
+# Environment & Config
+# ============================================================================
+.env
+.env.local
 *.log
+
+# ============================================================================
+# Temporary files
+# ============================================================================
+tmp/
+temp/
+*.tmp
+*.bak
+*.orig
+
+# ============================================================================
+# Project specific
+# ============================================================================
+# Experimental/failed attempts
+experimental/
+
+# Test files
+utils/.test_imports.py
+
+# Experimental configs
+configs/experimental/
+configs/temp*.toml
