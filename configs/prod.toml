@@ -1,40 +1,39 @@
-# Production run settings - Full DeepSeek-inspired training
-# WARNING: This trains on 1000+ examples and takes 4-8+ HOURS!
-# Use medium.toml for faster results
+# Production run settings - Real production-quality training
+# WARNING: This will take several hours! Use medium.toml for faster iterations.
 
-model_name = "utils/mlx_model"    # Your converted model (change if different)
+model_name = "utils/mlx_model"    # ← YOUR converted model (quantized!)
 output_dir = "outputs/production-run"
 run_name   = "qwen-1.5b-production"
 
-# training
+# training (production quality)
 learning_rate = 1e-6
 num_epochs = 1
 batch_size = 1
-gradient_accumulation_steps = 4
-max_train_samples = 1000          # Limit to 1000 (full = 7473 takes forever!)
+gradient_accumulation_steps = 4    # Accumulate over 4 steps for stability
+max_train_samples = 2000           # Train on 2000 examples for real learning
 warmup_ratio = 0.1
 max_grad_norm = 0.1
 logging_steps = 1
 save_steps = 100
 
-# sampling / rollout
-num_generations = 64
-max_new_tokens = 512
+# sampling / rollout (production quality - enough for diversity)
+num_generations = 16               # 16 generations for good advantage estimates
+max_new_tokens = 256               # Longer completions for full reasoning
 max_prompt_length = 512
 max_completion_length = 1024
 temperature = 0.7
 clip_eps = 0.2
 kl_coeff = 0.0
 
-# eval & logging
+# eval & logging (comprehensive)
 eval_steps = 50
-eval_samples = 200
+eval_samples = 200                 # Proper eval sample size
 eval_every_updates = 25
-eval_subset_size = 200
-eval_max_new_tokens = 512
+eval_subset_size = 100             # Decent subset for ongoing eval
+eval_max_new_tokens = 256          # Full reasoning in eval
 log_jsonl = true
 
 # system
 seed = 0
-use_compile = true
+use_compile = true                 # Enable compilation for speed
 
